@@ -52,6 +52,13 @@ MOTIFS_SORTIE = [
 
 st.set_page_config(page_title="Cockpit appels — Hympyr", page_icon="📞", layout="wide")
 
+# Compteur de modifications depuis le dernier export (garde-fou anti-perte)
+if "modifs_non_sauvees" not in st.session_state:
+    st.session_state.modifs_non_sauvees = 0
+
+def marquer_modif():
+    st.session_state.modifs_non_sauvees += 1
+
 st.markdown(f"""
 <style>
   h1, h2, h3 {{ color: {VERT_FONCE}; }}
@@ -149,6 +156,103 @@ def charger_suivi_adresses() -> pd.DataFrame:
     df = pd.read_sql("SELECT * FROM suivi_adresses", con, dtype=str)
     con.close()
     return df
+
+
+def _retrouver(colnames, *cibles):
+    """Retrouve un nom de colonne quelle que soit la casse/les espaces."""
+    norm = {str(c).strip().lower(): c for c in colnames}
+    for cible in cibles:
+        if cible in norm:
+            return norm[cible]
+    return None
+
+
+def _lire_csv_robuste(file) -> pd.DataFrame:
+    """Lit un CSV exporté par l'outil (séparateur ; et BOM UTF-8), avec repli sur la virgule."""
+    raw = file.read()
+    if isinstance(raw, bytes):
+        texte = raw.decode("utf-8-sig", errors="replace")
+    else:
+        texte = raw.lstrip("\ufeff")
+    # On choisit le séparateur le plus présent sur la 1re ligne
+    premiere = texte.splitlines()[0] if texte.strip() else ""
+    sep = ";" if premiere.count(";") >= premiere.count(",") else ","
+    return pd.read_csv(io.StringIO(texte), sep=sep, dtype=str).fillna("")
+
+
+def importer_suivi_clients_csv(file) -> int:
+    """Réinjecte un CSV de suivi clients (export du soir) dans la base. Renvoie le nb de lignes."""
+    df = _lire_csv_robuste(file)
+    # accepter aussi bien les noms techniques que les libellés français de l'export
+    m = {
+        "code_client":  _retrouver(df.columns, "code_client", "code client"),
+        "statut":       _retrouver(df.columns, "statut", "statut de l'appel"),
+        "existe":       _retrouver(df.columns, "existe", "client actif ?"),
+        "produits":     _retrouver(df.columns, "produits", "produits achetés"),
+        "email_maj":    _retrouver(df.columns, "email_maj", "e-mail confirmé"),
+        "tel_maj":      _retrouver(df.columns, "tel_maj", "téléphone confirmé"),
+        "doublon_de":   _retrouver(df.columns, "doublon_de", "doublon du n°"),
+        "motif_sortie": _retrouver(df.columns, "motif_sortie", "motif de sortie"),
+        "rappel_date":  _retrouver(df.columns, "rappel_date", "à rappeler le"),
+        "note":         _retrouver(df.columns, "note", "notes"),
+    }
+    if not m["code_client"]:
+        raise ValueError("Le CSV de suivi clients doit contenir une colonne « code_client ».")
+    def val(r, key):
+        col = m.get(key)
+        return str(r[col]).strip() if col else ""
+    n = 0
+    for _, r in df.iterrows():
+        code = val(r, "code_client")
+        if not code:
+            continue
+        prod = val(r, "produits")
+        prod = "|".join(x.strip() for x in prod.replace(";", ",").split(",") if x.strip())
+        enregistrer(
+            code,
+            statut=val(r, "statut") or "À appeler",
+            existe=val(r, "existe"),
+            produits=prod,
+            email_maj=val(r, "email_maj"),
+            tel_maj=val(r, "tel_maj"),
+            doublon_de=val(r, "doublon_de"),
+            motif_sortie=val(r, "motif_sortie"),
+            note=val(r, "note"),
+            rappel_date="",
+        )
+        n += 1
+    return n
+
+
+def importer_suivi_adresses_csv(file) -> int:
+    """Réinjecte un CSV de référents (export du soir) dans la base. Renvoie le nb de lignes."""
+    df = _lire_csv_robuste(file)
+    m = {
+        "code_adresse": _retrouver(df.columns, "code_adresse", "code adresse"),
+        "referent":     _retrouver(df.columns, "referent", "référent sur place"),
+        "tel_site":     _retrouver(df.columns, "tel_site", "tél. référent / site", "tel. référent / site"),
+        "statut_adr":   _retrouver(df.columns, "statut_adr", "statut vérification"),
+        "note_adr":     _retrouver(df.columns, "note_adr", "note"),
+    }
+    if not m["code_adresse"]:
+        raise ValueError("Le CSV des référents doit contenir une colonne « code_adresse ».")
+    def val(r, key):
+        col = m.get(key)
+        return str(r[col]).strip() if col else ""
+    n = 0
+    for _, r in df.iterrows():
+        cad = val(r, "code_adresse")
+        if not cad:
+            continue
+        enregistrer_adresse(
+            cad,
+            referent=val(r, "referent"),
+            tel_site=val(r, "tel_site"),
+            statut_adr=val(r, "statut_adr") or "À vérifier",
+            note_adr=val(r, "note_adr"),
+        )
+        n += 1
+    return n
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -369,6 +473,31 @@ if not adresses.empty:
             adresses = adresses.rename(columns={col: dest})
     adresses = adresses.loc[:, ~adresses.columns.duplicated(keep="first")]
 
+# ── REPRISE DU TRAVAIL DE LA VEILLE (import des CSV de suivi) ──
+with st.expander("🔄 Reprendre le travail de la veille (à faire chaque matin)", expanded=False):
+    st.caption("Importe ici les deux fichiers de sauvegarde exportés hier soir. "
+               "Sans ça, l'outil repart de l'état actuel sur ce serveur (qui peut avoir été réinitialisé).")
+    ci1, ci2 = st.columns(2)
+    up_suivi = ci1.file_uploader("Sauvegarde SUIVI CLIENTS (CSV)", type=["csv"], key="imp_cli")
+    up_refer = ci2.file_uploader("Sauvegarde RÉFÉRENTS (CSV)", type=["csv"], key="imp_adr")
+    if st.button("📥 Restaurer ces sauvegardes", type="primary"):
+        msgs = []
+        try:
+            if up_suivi is not None:
+                n = importer_suivi_clients_csv(up_suivi)
+                msgs.append(f"{n} fiches clients restaurées")
+            if up_refer is not None:
+                n = importer_suivi_adresses_csv(up_refer)
+                msgs.append(f"{n} référents restaurés")
+            if msgs:
+                st.session_state.modifs_non_sauvees = 0  # on repart d'un état "sauvegardé"
+                st.success("✅ " + " · ".join(msgs) + ". Tu peux reprendre où tu t'étais arrêtée.")
+                st.cache_data.clear()
+            else:
+                st.info("Aucun fichier sélectionné.")
+        except Exception as e:
+            st.error(f"Import impossible : {e}")
+
 suivi = charger_suivi()
 base = clients.merge(suivi, left_on=col_code, right_on="code_client", how="left")
 # Colonnes issues du suivi : remplacer les NaN par "" pour éviter les erreurs .split()
@@ -383,6 +512,13 @@ base["priorite"] = base["Type client"].map(priorite)
 # BARRE LATÉRALE : avancement + filtres
 # ─────────────────────────────────────────────────────────────────────────────
 with st.sidebar:
+    nb = st.session_state.get("modifs_non_sauvees", 0)
+    if nb > 0:
+        st.error(f"⚠️ {nb} modification(s) NON sauvegardée(s).\n\n"
+                 f"Pense à exporter tes CSV avant de fermer (onglet Tableau de bord).")
+    else:
+        st.success("✅ Travail à jour (rien à sauvegarder pour l'instant).")
+    st.divider()
     st.header("Avancement")
     total = len(base)
     faits = base["statut"].isin(STATUTS_TERMINES).sum()
@@ -550,6 +686,7 @@ with onglet_appel:
                 motif_sortie="" if motif_sortie == "—" else motif_sortie,
                 rappel_date=rappel.isoformat() if rappel else "",
             )
+            marquer_modif()
             st.session_state.idx = min(len(file) - 1, st.session_state.idx + 1)
             st.rerun()
 
@@ -635,12 +772,17 @@ with onglet_adr:
                 if ok_adr:
                     enregistrer_adresse(cad, referent=referent.strip(), tel_site=tel_site.strip(),
                                         statut_adr=statut_adr, note_adr=note_adr.strip())
+                    marquer_modif()
                     st.session_state.idx_adr = min(len(vue) - 1, st.session_state.idx_adr + 1)
                     st.rerun()
 
 
 # ── ONGLET TABLEAU DE BORD ───────────────────────────────────────────────────
 with onglet_dash:
+    nb = st.session_state.get("modifs_non_sauvees", 0)
+    if nb > 0:
+        st.warning(f"🔔 Sauvegarde du soir : tu as {nb} modification(s) à exporter. "
+                   f"Télécharge les CSV ci-dessous **avant de fermer l'onglet**.")
     st.subheader("Avancement de la campagne")
     s = charger_suivi()
     cc1, cc2, cc3, cc4 = st.columns(4)
@@ -709,6 +851,12 @@ with onglet_dash:
 
         with st.expander("Aperçu de l'export clients"):
             st.dataframe(export, hide_index=True, use_container_width=True)
+
+        if st.session_state.get("modifs_non_sauvees", 0) > 0:
+            st.caption("Une fois tes 2 fichiers téléchargés, confirme pour repasser au vert :")
+            if st.button("✅ J'ai bien téléchargé mes sauvegardes du soir"):
+                st.session_state.modifs_non_sauvees = 0
+                st.rerun()
 
     # ── Export dédié aux points de livraison / référents ──
     if not adresses.empty:

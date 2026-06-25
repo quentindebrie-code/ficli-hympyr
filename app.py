@@ -17,6 +17,7 @@ Lancement :
     streamlit run app.py
 """
 
+import io
 import sqlite3
 import datetime as dt
 from pathlib import Path
@@ -109,7 +110,8 @@ def enregistrer(code, **champs):
 # ─────────────────────────────────────────────────────────────────────────────
 @st.cache_data(show_spinner=False)
 def lire_fichier(file_bytes: bytes):
-    xls = pd.ExcelFile(file_bytes)
+    buffer = io.BytesIO(file_bytes)
+    xls = pd.ExcelFile(buffer, engine="openpyxl")
     clients = pd.read_excel(xls, "Clients", dtype=str).fillna("")
     adresses = (pd.read_excel(xls, "Adresses livraison", dtype=str).fillna("")
                 if "Adresses livraison" in xls.sheet_names else pd.DataFrame())

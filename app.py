@@ -39,9 +39,16 @@ PRODUITS = [
 
 STATUTS = [
     "À appeler", "À rappeler", "Injoignable",
-    "Fait ✅", "Ne plus contacter", "Doublon",
+    "Fait ✅", "Doublon", "Ancien client (à sortir)",
 ]
-STATUTS_TERMINES = {"Fait ✅", "Ne plus contacter", "Doublon"}
+STATUTS_TERMINES = {"Fait ✅", "Doublon", "Ancien client (à sortir)"}
+
+# Motifs de sortie quand le client n'est plus à conserver
+MOTIFS_SORTIE = [
+    "—", "Passé à la concurrence", "Utilise une autre énergie",
+    "Décès", "Cessation d'activité / fermeture", "Ne souhaite plus être contacté",
+    "Injoignable définitivement", "Autre",
+]
 
 st.set_page_config(page_title="Cockpit appels — Hympyr", page_icon="📞", layout="wide")
 
@@ -75,6 +82,22 @@ def db():
             note          TEXT,
             doublon_de    TEXT,
             rappel_date   TEXT,
+            motif_sortie  TEXT,
+            maj_le        TEXT
+        )
+    """)
+    # migration : colonnes ajoutées après coup
+    cols_exist = {r[1] for r in con.execute("PRAGMA table_info(suivi)").fetchall()}
+    for c in ("motif_sortie",):
+        if c not in cols_exist:
+            con.execute(f"ALTER TABLE suivi ADD COLUMN {c} TEXT")
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS suivi_adresses (
+            code_adresse  TEXT PRIMARY KEY,
+            referent      TEXT,
+            tel_site      TEXT,
+            statut_adr    TEXT,
+            note_adr      TEXT,
             maj_le        TEXT
         )
     """)
@@ -103,6 +126,29 @@ def enregistrer(code, **champs):
     )
     con.commit()
     con.close()
+
+
+def enregistrer_adresse(code_adresse, **champs):
+    con = db()
+    champs["code_adresse"] = str(code_adresse)
+    champs["maj_le"] = dt.datetime.now().isoformat(timespec="seconds")
+    cols = ",".join(champs.keys())
+    ph = ",".join("?" for _ in champs)
+    upd = ",".join(f"{k}=excluded.{k}" for k in champs if k != "code_adresse")
+    con.execute(
+        f"INSERT INTO suivi_adresses ({cols}) VALUES ({ph}) "
+        f"ON CONFLICT(code_adresse) DO UPDATE SET {upd}",
+        list(champs.values()),
+    )
+    con.commit()
+    con.close()
+
+
+def charger_suivi_adresses() -> pd.DataFrame:
+    con = db()
+    df = pd.read_sql("SELECT * FROM suivi_adresses", con, dtype=str)
+    con.close()
+    return df
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -171,6 +217,7 @@ def preparer_export(suivi_df: pd.DataFrame, base_df: pd.DataFrame) -> pd.DataFra
         "email_maj": "E-mail confirmé",
         "tel_maj": "Téléphone confirmé",
         "doublon_de": "Doublon du n°",
+        "motif_sortie": "Motif de sortie",
         "rappel_date": "À rappeler le",
         "note": "Notes",
         "maj_le": "Dernière mise à jour",
@@ -242,6 +289,9 @@ with st.sidebar:
                     st.warning("Rythme très faible : la projection est indicative.")
 
     st.divider()
+    st.header("🔎 Accès direct")
+    code_direct = st.text_input("Code client exact", help="Tape le code client et valide pour aller direct à la fiche.")
+    st.divider()
     st.header("Filtres")
     f_type = st.multiselect("Type de client", sorted(base["Type client"].unique()))
     f_statut = st.multiselect("Statut d'appel", STATUTS, default=["À appeler", "À rappeler"])
@@ -254,24 +304,35 @@ with st.sidebar:
 # FILE D'APPEL
 # ─────────────────────────────────────────────────────────────────────────────
 file = base.copy()
-if f_type:
-    file = file[file["Type client"].isin(f_type)]
-if f_statut:
-    file = file[file["statut"].isin(f_statut)]
-if f_acompl and "À compléter" in file.columns:
-    file = file[file["À compléter"].astype(str).str.strip() != ""]
-if recherche:
-    r = recherche.lower()
-    masque = (
-        file[col_code].str.lower().str.contains(r, na=False)
-        | file["Raison sociale / Nom"].str.lower().str.contains(r, na=False)
-        | file["Ville"].str.lower().str.contains(r, na=False)
-    )
-    file = file[masque]
-file = file.sort_values(["priorite", "Raison sociale / Nom"] if prio else ["Raison sociale / Nom"])
-file = file.reset_index(drop=True)
+# Accès direct par code client : court-circuite les filtres
+if code_direct.strip():
+    cd = code_direct.strip().upper()
+    direct = base[base[col_code].str.upper() == cd]
+    if direct.empty:
+        st.sidebar.error(f"Aucun client avec le code « {code_direct} ».")
+    else:
+        file = direct.reset_index(drop=True)
+        st.session_state.idx = 0
+if not code_direct.strip():
+  if f_type:
+        file = file[file["Type client"].isin(f_type)]
+  if f_statut:
+        file = file[file["statut"].isin(f_statut)]
+  if f_acompl and "À compléter" in file.columns:
+        file = file[file["À compléter"].astype(str).str.strip() != ""]
+  if recherche:
+        r = recherche.lower()
+        masque = (
+            file[col_code].str.lower().str.contains(r, na=False)
+            | file["Raison sociale / Nom"].str.lower().str.contains(r, na=False)
+            | file["Ville"].str.lower().str.contains(r, na=False)
+        )
+        file = file[masque]
+  file = file.sort_values(["priorite", "Raison sociale / Nom"] if prio else ["Raison sociale / Nom"])
+  file = file.reset_index(drop=True)
 
-onglet_appel, onglet_dash = st.tabs(["☎️  Appels", "📊  Tableau de bord"])
+onglet_appel, onglet_adr, onglet_dash = st.tabs(
+    ["☎️  Appels clients", "📦  Points de livraison", "📊  Tableau de bord"])
 
 # ── ONGLET APPELS ────────────────────────────────────────────────────────────
 with onglet_appel:
@@ -348,6 +409,12 @@ with onglet_appel:
             tel_maj = st.text_input("Téléphone confirmé / corrigé", value=row.get("tel_maj") or "")
             doublon_de = st.text_input("Doublon du client n°", value=row.get("doublon_de") or "",
                                        help="Si ce client est un doublon, indiquer le code à conserver.")
+            motif_sortie = st.selectbox(
+                "Motif de sortie (si ancien client)", MOTIFS_SORTIE,
+                index=MOTIFS_SORTIE.index(row.get("motif_sortie"))
+                if (row.get("motif_sortie") in MOTIFS_SORTIE) else 0,
+                help="À renseigner si le statut est « Ancien client (à sortir) »."
+            )
             rappel = st.date_input("Date de rappel (si applicable)", value=None)
             note = st.text_area("Notes (commercial, vérifs…)", value=row.get("note") or "", height=90)
             ok = st.form_submit_button("💾 Enregistrer & passer au suivant",
@@ -358,10 +425,97 @@ with onglet_appel:
                 produits="|".join(produits),
                 email_maj=email_maj.strip(), tel_maj=tel_maj.strip(),
                 doublon_de=doublon_de.strip(), note=note.strip(),
+                motif_sortie="" if motif_sortie == "—" else motif_sortie,
                 rappel_date=rappel.isoformat() if rappel else "",
             )
             st.session_state.idx = min(len(file) - 1, st.session_state.idx + 1)
             st.rerun()
+
+# ── ONGLET POINTS DE LIVRAISON ───────────────────────────────────────────────
+with onglet_adr:
+    if adresses.empty:
+        st.info("Le fichier ne contient pas de feuille « Adresses livraison ».")
+    else:
+        st.subheader("Vérification des points de livraison")
+        st.caption("Pour chaque adresse rattachée à une entreprise : qui est le référent sur place ?")
+
+        sa = charger_suivi_adresses()
+        adr = adresses.copy()
+        adr = adr.merge(sa, left_on="Code adresse", right_on="code_adresse", how="left")
+        for c in ["referent", "tel_site", "statut_adr", "note_adr"]:
+            if c in adr.columns:
+                adr[c] = adr[c].fillna("")
+        adr["statut_adr"] = adr["statut_adr"].replace("", "À vérifier")
+
+        # Indicateurs
+        a1, a2, a3 = st.columns(3)
+        a1.metric("Points de livraison", len(adr))
+        a2.metric("Vérifiés", int((adr["statut_adr"] == "Vérifié ✅").sum()))
+        a3.metric("Restants", int((adr["statut_adr"] != "Vérifié ✅").sum()))
+
+        # Recherche directe par code adresse OU par code client mère
+        rcol1, rcol2 = st.columns(2)
+        q_adr = rcol1.text_input("🔎 Code adresse exact (ex. 12771L56)")
+        q_mere = rcol2.text_input("🔎 ou Code client mère (montre tous ses points)")
+
+        vue = adr.copy()
+        if q_adr.strip():
+            vue = vue[vue["Code adresse"].str.upper() == q_adr.strip().upper()]
+        elif q_mere.strip():
+            vue = vue[vue["Code client mère"].str.upper() == q_mere.strip().upper()]
+        else:
+            f_av = st.multiselect("Statut", ["À vérifier", "Vérifié ✅", "Adresse obsolète"],
+                                  default=["À vérifier"])
+            if f_av:
+                vue = vue[vue["statut_adr"].isin(f_av)]
+        vue = vue.reset_index(drop=True)
+
+        if vue.empty:
+            st.success("Aucun point de livraison à afficher avec ce filtre.")
+        else:
+            if "idx_adr" not in st.session_state:
+                st.session_state.idx_adr = 0
+            st.session_state.idx_adr = max(0, min(st.session_state.idx_adr, len(vue) - 1))
+
+            n1, n2, n3 = st.columns([1, 2, 1])
+            if n1.button("⬅️ Précédent", key="adr_prev", use_container_width=True):
+                st.session_state.idx_adr = max(0, st.session_state.idx_adr - 1); st.rerun()
+            if n3.button("Suivant ➡️", key="adr_next", use_container_width=True):
+                st.session_state.idx_adr = min(len(vue) - 1, st.session_state.idx_adr + 1); st.rerun()
+            n2.markdown(f"<div style='text-align:center;font-weight:600;color:{VERT}'>"
+                        f"Point {st.session_state.idx_adr + 1} / {len(vue)}</div>", unsafe_allow_html=True)
+
+            a = vue.iloc[st.session_state.idx_adr]
+            cad = a["Code adresse"]
+            adr_txt = " ".join(x for x in [a.get("Adresse 1",""), a.get("Adresse 2",""), a.get("Adresse 3","")] if x)
+            g, d = st.columns([3, 2])
+            with g:
+                st.markdown(f"### {a.get('Nom site','') or 'Point de livraison'}")
+                st.markdown(
+                    f"<span class='pill'>Adresse {cad}</span>"
+                    f"<span style='color:#5a6b62'>Client mère : {a.get('Code client mère','')}</span>",
+                    unsafe_allow_html=True)
+                st.markdown(f"""<div class='fiche'>
+                    📍 {adr_txt}<br>{a.get('Code postal','')} {a.get('Ville','')}<br><br>
+                    ☎️ {a.get('Téléphone','') or '<i>aucun téléphone</i>'}
+                    </div>""", unsafe_allow_html=True)
+            with d:
+                st.markdown("#### Référent du site")
+                with st.form("adr_form"):
+                    referent = st.text_input("Nom du référent sur place", value=a.get("referent") or "")
+                    tel_site = st.text_input("Téléphone du site / référent", value=a.get("tel_site") or "")
+                    statut_adr = st.selectbox("Statut", ["À vérifier", "Vérifié ✅", "Adresse obsolète"],
+                        index=["À vérifier","Vérifié ✅","Adresse obsolète"].index(a["statut_adr"])
+                        if a["statut_adr"] in ["À vérifier","Vérifié ✅","Adresse obsolète"] else 0)
+                    note_adr = st.text_area("Note", value=a.get("note_adr") or "", height=80)
+                    ok_adr = st.form_submit_button("💾 Enregistrer & suivant",
+                                                   use_container_width=True, type="primary")
+                if ok_adr:
+                    enregistrer_adresse(cad, referent=referent.strip(), tel_site=tel_site.strip(),
+                                        statut_adr=statut_adr, note_adr=note_adr.strip())
+                    st.session_state.idx_adr = min(len(vue) - 1, st.session_state.idx_adr + 1)
+                    st.rerun()
+
 
 # ── ONGLET TABLEAU DE BORD ───────────────────────────────────────────────────
 with onglet_dash:

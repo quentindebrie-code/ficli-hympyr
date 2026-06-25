@@ -229,6 +229,54 @@ def preparer_export(suivi_df: pd.DataFrame, base_df: pd.DataFrame) -> pd.DataFra
     return df
 
 
+def preparer_export_adresses(suivi_adr: pd.DataFrame, adresses_df: pd.DataFrame) -> pd.DataFrame:
+    """Tableau lisible des points de livraison + référents vérifiés."""
+    if adresses_df.empty:
+        return pd.DataFrame()
+    base_adr = adresses_df.copy()
+    code_adr = "Code adresse" if "Code adresse" in base_adr.columns else base_adr.columns[0]
+    mere = "Code client mère" if "Code client mère" in base_adr.columns else ""
+    cols_src = {
+        code_adr: "Code adresse",
+        mere: "Code client mère",
+        "Nom site": "Nom du site",
+        "Ville": "Ville",
+        "Code postal": "Code postal",
+    }
+    cols_src = {k: v for k, v in cols_src.items() if k and k in base_adr.columns}
+    out = base_adr[list(cols_src.keys())].rename(columns=cols_src)
+
+    sa = suivi_adr.copy().fillna("") if not suivi_adr.empty else pd.DataFrame(
+        columns=["code_adresse", "referent", "tel_site", "statut_adr", "note_adr", "maj_le"])
+    out = out.merge(sa, left_on="Code adresse", right_on="code_adresse", how="left").fillna("")
+
+    def jolie(x):
+        x = str(x).strip()
+        if not x:
+            return ""
+        try:
+            return pd.to_datetime(x).strftime("%d/%m/%Y %H:%M")
+        except Exception:
+            return x
+    out["maj_le"] = out.get("maj_le", "").map(jolie)
+    out["statut_adr"] = out.get("statut_adr", "").replace("", "À vérifier")
+
+    libelles = {
+        "referent": "Référent sur place",
+        "tel_site": "Tél. référent / site",
+        "statut_adr": "Statut vérification",
+        "note_adr": "Note",
+        "maj_le": "Dernière mise à jour",
+    }
+    for c in libelles:
+        if c not in out.columns:
+            out[c] = ""
+    ordre = ["Code adresse", "Code client mère", "Nom du site", "Code postal", "Ville",
+             "referent", "tel_site", "statut_adr", "note_adr", "maj_le"]
+    ordre = [c for c in ordre if c in out.columns]
+    return out[ordre].rename(columns=libelles)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # EN-TÊTE
 # ─────────────────────────────────────────────────────────────────────────────
@@ -659,5 +707,49 @@ with onglet_dash:
             use_container_width=True,
         )
 
-        with st.expander("Aperçu de l'export"):
+        with st.expander("Aperçu de l'export clients"):
             st.dataframe(export, hide_index=True, use_container_width=True)
+
+    # ── Export dédié aux points de livraison / référents ──
+    if not adresses.empty:
+        st.divider()
+        st.markdown("##### Export des points de livraison (référents)")
+        st.caption("Référents vérifiés dans l'onglet « Points de livraison ».")
+        sa = charger_suivi_adresses()
+        export_adr = preparer_export_adresses(sa, adresses)
+        if export_adr.empty:
+            st.info("Aucun point de livraison à exporter.")
+        else:
+            ca1, ca2 = st.columns(2)
+            csv_adr = export_adr.to_csv(index=False, sep=";").encode("utf-8-sig")
+            ca1.download_button(
+                "⬇️ Points de livraison — CSV (Excel FR)",
+                csv_adr,
+                file_name=f"points_livraison_hympyr_{dt.date.today():%Y%m%d}.csv",
+                mime="text/csv",
+                use_container_width=True,
+            )
+            xbuf2 = io.BytesIO()
+            with pd.ExcelWriter(xbuf2, engine="openpyxl") as writer:
+                export_adr.to_excel(writer, index=False, sheet_name="Points de livraison")
+                ws2 = writer.sheets["Points de livraison"]
+                from openpyxl.styles import Font as _F, PatternFill as _PF, Alignment as _AL
+                for j, col in enumerate(export_adr.columns, 1):
+                    c = ws2.cell(row=1, column=j)
+                    c.fill = _PF("solid", fgColor="0D3D27")
+                    c.font = _F(bold=True, color="FFFFFF")
+                    c.alignment = _AL(horizontal="center", vertical="center", wrap_text=True)
+                    larg = min(max(len(str(col)) + 2,
+                               int(export_adr[col].astype(str).str.len().head(200).max() or 10) + 2), 45)
+                    ws2.column_dimensions[ws2.cell(row=1, column=j).column_letter].width = larg
+                ws2.freeze_panes = "A2"
+                ws2.auto_filter.ref = ws2.dimensions
+            ca2.download_button(
+                "⬇️ Points de livraison — Excel (.xlsx)",
+                xbuf2.getvalue(),
+                file_name=f"points_livraison_hympyr_{dt.date.today():%Y%m%d}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+            )
+            with st.expander("Aperçu de l'export points de livraison"):
+                st.dataframe(export_adr, hide_index=True, use_container_width=True)

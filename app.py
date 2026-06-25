@@ -134,7 +134,7 @@ def priorite(type_client: str) -> int:
 # ─────────────────────────────────────────────────────────────────────────────
 # EN-TÊTE
 # ─────────────────────────────────────────────────────────────────────────────
-st.title("📞 Cockpit de campagne d'appels — Hympyr Énergies")
+st.title("Hympyr Energies")
 st.caption("Outil de pilotage. La mise à jour des données se fait dans Logimatique ; "
            "cet outil suit l'avancement et donne le bon ordre d'appel.")
 

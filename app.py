@@ -132,12 +132,62 @@ def priorite(type_client: str) -> int:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# PRÉPARATION DE L'EXPORT (lisible, en français)
+# ─────────────────────────────────────────────────────────────────────────────
+def preparer_export(suivi_df: pd.DataFrame, base_df: pd.DataFrame) -> pd.DataFrame:
+    """Construit un tableau de suivi propre et lisible pour Excel."""
+    df = suivi_df.copy().fillna("")
+
+    # Récupérer le nom et la ville du client depuis la base
+    infos = base_df[[col_code, "Raison sociale / Nom", "Ville", "Type client"]].copy()
+    infos = infos.rename(columns={col_code: "code_client"})
+    df = df.merge(infos, on="code_client", how="left")
+
+    # Produits : remplacer le séparateur technique | par une virgule lisible
+    df["produits"] = df["produits"].fillna("").str.replace("|", ", ", regex=False)
+
+    # Dates lisibles JJ/MM/AAAA + heure pour la dernière maj
+    def jolie_date(x, avec_heure=False):
+        x = str(x).strip()
+        if not x:
+            return ""
+        try:
+            d = pd.to_datetime(x)
+            return d.strftime("%d/%m/%Y %H:%M") if avec_heure else d.strftime("%d/%m/%Y")
+        except Exception:
+            return x
+    df["rappel_date"] = df["rappel_date"].map(lambda v: jolie_date(v))
+    df["maj_le"] = df["maj_le"].map(lambda v: jolie_date(v, avec_heure=True))
+
+    # Ordre et libellés français
+    colonnes = {
+        "code_client": "Code client",
+        "Raison sociale / Nom": "Nom / Raison sociale",
+        "Ville": "Ville",
+        "Type client": "Type",
+        "statut": "Statut de l'appel",
+        "existe": "Client actif ?",
+        "produits": "Produits achetés",
+        "email_maj": "E-mail confirmé",
+        "tel_maj": "Téléphone confirmé",
+        "doublon_de": "Doublon du n°",
+        "rappel_date": "À rappeler le",
+        "note": "Notes",
+        "maj_le": "Dernière mise à jour",
+    }
+    for c in colonnes:
+        if c not in df.columns:
+            df[c] = ""
+    df = df[list(colonnes.keys())].rename(columns=colonnes)
+    return df
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # EN-TÊTE
 # ─────────────────────────────────────────────────────────────────────────────
-st.title("Outil de suivi MAJ fichier clients")
+st.title("📞 Cockpit de campagne d'appels — Hympyr Énergies")
 st.caption("Outil de pilotage. La mise à jour des données se fait dans Logimatique ; "
-           "cet outil suit l'avancement et donne le bon ordre d'appel ;"
-           "cet outil doit rester actif jusqu'à la fin de la MAJ du fichier.")
+           "cet outil suit l'avancement et donne le bon ordre d'appel.")
 
 up = st.file_uploader("Charger le fichier clients restructuré (.xlsx)", type=["xlsx"])
 if not up:
@@ -338,10 +388,48 @@ with onglet_dash:
 
     st.divider()
     st.markdown("##### Export du suivi (sauvegarde / reporting)")
-    st.caption("Trace de la campagne. À conserver comme sauvegarde — la donnée de référence reste Logimatique.")
-    if not s.empty:
-        st.download_button("⬇️ Télécharger le suivi (CSV)",
-                           s.to_csv(index=False).encode("utf-8"),
-                           file_name="suivi_appels_hympyr.csv", mime="text/csv")
-    else:
+    st.caption("Trace de la campagne, lisible dans Excel. "
+               "La donnée de référence reste Logimatique — ceci est une sauvegarde.")
+
+    if s.empty:
         st.info("Aucun appel enregistré pour le moment.")
+    else:
+        export = preparer_export(s, base)
+        col_csv, col_xlsx = st.columns(2)
+
+        # CSV pensé pour Excel français : séparateur ; et BOM UTF-8
+        csv_bytes = export.to_csv(index=False, sep=";").encode("utf-8-sig")
+        col_csv.download_button(
+            "⬇️ Export CSV (Excel FR)",
+            csv_bytes,
+            file_name=f"suivi_appels_hympyr_{dt.date.today():%Y%m%d}.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
+
+        # Excel mis en forme
+        xbuf = io.BytesIO()
+        with pd.ExcelWriter(xbuf, engine="openpyxl") as writer:
+            export.to_excel(writer, index=False, sheet_name="Suivi appels")
+            ws = writer.sheets["Suivi appels"]
+            from openpyxl.styles import Font, PatternFill, Alignment
+            for j, col in enumerate(export.columns, 1):
+                c = ws.cell(row=1, column=j)
+                c.fill = PatternFill("solid", fgColor="0D3D27")
+                c.font = Font(bold=True, color="FFFFFF")
+                c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+                largeur = min(max(len(str(col)) + 2,
+                              int(export[col].astype(str).str.len().head(200).max() or 10) + 2), 45)
+                ws.column_dimensions[ws.cell(row=1, column=j).column_letter].width = largeur
+            ws.freeze_panes = "A2"
+            ws.auto_filter.ref = ws.dimensions
+        col_xlsx.download_button(
+            "⬇️ Export Excel (.xlsx)",
+            xbuf.getvalue(),
+            file_name=f"suivi_appels_hympyr_{dt.date.today():%Y%m%d}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+        )
+
+        with st.expander("Aperçu de l'export"):
+            st.dataframe(export, hide_index=True, use_container_width=True)

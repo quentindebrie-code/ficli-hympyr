@@ -134,9 +134,10 @@ def priorite(type_client: str) -> int:
 # ─────────────────────────────────────────────────────────────────────────────
 # EN-TÊTE
 # ─────────────────────────────────────────────────────────────────────────────
-st.title("📞 Cockpit de campagne d'appels — Hympyr Énergies")
+st.title("Outil de suivi MAJ fichier clients")
 st.caption("Outil de pilotage. La mise à jour des données se fait dans Logimatique ; "
-           "cet outil suit l'avancement et donne le bon ordre d'appel.")
+           "cet outil suit l'avancement et donne le bon ordre d'appel ;"
+           "cet outil doit rester actif jusqu'à la fin de la MAJ du fichier.")
 
 up = st.file_uploader("Charger le fichier clients restructuré (.xlsx)", type=["xlsx"])
 if not up:

@@ -134,7 +134,7 @@ def priorite(type_client: str) -> int:
 # ─────────────────────────────────────────────────────────────────────────────
 # EN-TÊTE
 # ─────────────────────────────────────────────────────────────────────────────
-st.title("Hympyr Energies")
+st.title("📞 Cockpit de campagne d'appels — Hympyr Énergies")
 st.caption("Outil de pilotage. La mise à jour des données se fait dans Logimatique ; "
            "cet outil suit l'avancement et donne le bon ordre d'appel.")
 
@@ -151,7 +151,11 @@ if col_code not in clients.columns:
 
 suivi = charger_suivi()
 base = clients.merge(suivi, left_on=col_code, right_on="code_client", how="left")
-base["statut"] = base["statut"].fillna("À appeler")
+# Colonnes issues du suivi : remplacer les NaN par "" pour éviter les erreurs .split()
+for _c in ["statut","existe","produits","email_maj","tel_maj","note","doublon_de","rappel_date"]:
+    if _c in base.columns:
+        base[_c] = base[_c].fillna("")
+base["statut"] = base["statut"].replace("", "À appeler")
 base["priorite"] = base["Type client"].map(priorite)
 
 
@@ -280,7 +284,7 @@ with onglet_appel:
     # Formulaire d'appel
     with droite:
         st.markdown("#### Résultat de l'appel")
-        prod_init = [p for p in (row.get("produits") or "").split("|") if p in PRODUITS]
+        prod_init = [p for p in str(row.get("produits") or "").split("|") if p in PRODUITS]
         with st.form("appel", clear_on_submit=False):
             statut = st.selectbox("Statut", STATUTS,
                                   index=STATUTS.index(row["statut"]) if row["statut"] in STATUTS else 0)

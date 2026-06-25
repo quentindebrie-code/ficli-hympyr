@@ -242,10 +242,84 @@ if not up:
     st.stop()
 
 clients, adresses = lire_fichier(up.getvalue())
-col_code = "Code client"
-if col_code not in clients.columns:
-    st.error("La feuille « Clients » doit contenir une colonne « Code client ».")
+
+def trouver_colonne(df, cibles):
+    """Retrouve une colonne quelle que soit la casse / les espaces."""
+    norm = {str(c).strip().lower(): c for c in df.columns}
+    for cible in cibles:
+        if cible in norm:
+            return norm[cible]
+    return None
+
+col_code = trouver_colonne(clients, ["code client", "code_client"])
+if col_code is None:
+    st.error("La feuille « Clients » doit contenir une colonne « Code client » "
+             f"(colonnes trouvées : {', '.join(map(str, clients.columns))}).")
     st.stop()
+
+# Harmoniser les noms attendus par le reste de l'outil
+renoms = {}
+# Nom : "Raison sociale / Nom" si présent, sinon "Nom"
+c_nom = trouver_colonne(clients, ["raison sociale / nom"]) or trouver_colonne(clients, ["nom", "raison sociale"])
+if c_nom and c_nom != "Raison sociale / Nom":
+    renoms[c_nom] = "Raison sociale / Nom"
+c_type = trouver_colonne(clients, ["type client", "type"])
+if c_type and c_type != "Type client":
+    renoms[c_type] = "Type client"
+c_ville = trouver_colonne(clients, ["ville"])
+if c_ville and c_ville != "Ville":
+    renoms[c_ville] = "Ville"
+c_cat = trouver_colonne(clients, ["catégorie normalisée", "catégorie", "categorie"])
+if c_cat and c_cat != "Catégorie":
+    renoms[c_cat] = "Catégorie"
+c_siren = trouver_colonne(clients, ["siren (9 chiffres)", "siren", "siren / siret"])
+if c_siren and c_siren != "SIREN":
+    renoms[c_siren] = "SIREN"
+c_cp = trouver_colonne(clients, ["code postal", "code_postal"])
+if c_cp and c_cp != "Code postal":
+    renoms[c_cp] = "Code postal"
+# Téléphones : privilégier les versions normalisées (norm)
+for n in (1, 2, 3):
+    col = (trouver_colonne(clients, [f"téléphone {n} (norm)"])
+           or trouver_colonne(clients, [f"téléphone {n}", f"telephone {n}"]))
+    if col and col != f"Téléphone {n}":
+        renoms[col] = f"Téléphone {n}"
+if renoms:
+    clients = clients.rename(columns=renoms)
+# Le renommage peut créer des doublons de noms (version nettoyée + version d'origine).
+# On garde la PREMIÈRE occurrence (placée en tête = la version nettoyée).
+clients = clients.loc[:, ~clients.columns.duplicated(keep="first")]
+
+# Sécuriser les colonnes optionnelles attendues plus loin
+for c in ["Raison sociale / Nom", "Type client", "Ville", "Catégorie", "À compléter",
+          "Email principal", "Email secondaire", "SIREN",
+          "Téléphone 1", "Téléphone 2", "Téléphone 3",
+          "Adresse 1", "Adresse 2", "Adresse 3", "Code postal"]:
+    if c not in clients.columns:
+        clients[c] = ""
+
+# Adapter le nom de la colonne adresses (mère) si besoin
+if not adresses.empty:
+    cam = trouver_colonne(adresses, ["code client mère", "code client mere"])
+    if cam and cam != "Code client mère":
+        adresses = adresses.rename(columns={cam: "Code client mère"})
+    # Dans la feuille Adresses, l'identifiant de l'adresse est la colonne "Code Client"
+    # (ex. 12771L56). On la renomme en "Code adresse" pour le reste de l'outil,
+    # SAUF si une colonne "Code adresse" existe déjà.
+    if "Code adresse" not in adresses.columns:
+        cad = trouver_colonne(adresses, ["code adresse"]) or trouver_colonne(adresses, ["code client"])
+        if cad:
+            adresses = adresses.rename(columns={cad: "Code adresse"})
+    # Normaliser aussi les autres colonnes attendues de la feuille Adresses
+    for src_names, dest in [
+        (["téléphone 1 (norm)", "téléphone 1", "telephone 1"], "Téléphone"),
+        (["code postal"], "Code postal"),
+        (["nom site", "nom"], "Nom site"),
+    ]:
+        col = trouver_colonne(adresses, src_names)
+        if col and col != dest and dest not in adresses.columns:
+            adresses = adresses.rename(columns={col: dest})
+    adresses = adresses.loc[:, ~adresses.columns.duplicated(keep="first")]
 
 suivi = charger_suivi()
 base = clients.merge(suivi, left_on=col_code, right_on="code_client", how="left")

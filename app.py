@@ -399,7 +399,7 @@ def preparer_export_adresses(suivi_adr: pd.DataFrame, adresses_df: pd.DataFrame)
 # ─────────────────────────────────────────────────────────────────────────────
 # EN-TÊTE
 # ─────────────────────────────────────────────────────────────────────────────
-st.title("📞 Cockpit de campagne d'appels — Hympyr Énergies")
+st.title("Suivi de la mise à jour du fichier clients Hympyr Energies")
 st.caption("Outil de pilotage. La mise à jour des données se fait dans Logimatique ; "
            "cet outil suit l'avancement et donne le bon ordre d'appel.")
 

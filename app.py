@@ -412,12 +412,36 @@ st.title("📞 Cockpit de campagne d'appels — Hympyr Énergies")
 st.caption("Outil de pilotage. La mise à jour des données se fait dans Logimatique ; "
            "cet outil suit l'avancement et donne le bon ordre d'appel.")
 
-up = st.file_uploader("Charger le fichier clients restructuré (.xlsx)", type=["xlsx"])
-if not up:
-    st.info("⬆️ Charge le fichier **CLIENTS_HYMPYR_restructure.xlsx** pour démarrer.")
-    st.stop()
+# Le fichier mère est mémorisé en session : il reste chargé tant que l'onglet
+# du navigateur n'est pas fermé, pour ne pas avoir à le re-téléverser à chaque fois.
+if "fichier_mere" not in st.session_state:
+    st.session_state.fichier_mere = None
 
-clients, adresses = lire_fichier(up.getvalue())
+if st.session_state.fichier_mere is None:
+    up = st.file_uploader("Charger le fichier clients restructuré (.xlsx)", type=["xlsx"])
+    if up is not None:
+        st.session_state.fichier_mere = up.getvalue()
+        st.rerun()
+    else:
+        st.info("⬆️ Charge le fichier **CLIENTS_HYMPYR_restructure.xlsx** pour démarrer.")
+        st.stop()
+
+# Barre d'actions : rafraîchir l'affichage, ou changer de fichier
+ac1, ac2, ac3 = st.columns([1.3, 1.3, 4])
+if ac1.button("🔄 Mettre à jour les données", use_container_width=True,
+              help="Recalcule l'avancement et l'affichage à partir de l'état enregistré, "
+                   "sans recharger le fichier."):
+    st.cache_data.clear()
+    st.rerun()
+if ac2.button("📂 Changer de fichier", use_container_width=True,
+              help="Charger un autre fichier clients (efface seulement le fichier en mémoire, "
+                   "pas le suivi des appels)."):
+    st.session_state.fichier_mere = None
+    st.cache_data.clear()
+    st.rerun()
+ac3.caption("Fichier chargé ✅ — il reste en mémoire, inutile de le recharger après un rafraîchissement.")
+
+clients, adresses = lire_fichier(st.session_state.fichier_mere)
 
 def trouver_colonne(df, cibles):
     """Retrouve une colonne quelle que soit la casse / les espaces."""

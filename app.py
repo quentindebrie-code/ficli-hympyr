@@ -405,7 +405,7 @@ st.caption("Outil de pilotage. La mise à jour des données se fait dans Logimat
 
 up = st.file_uploader("Charger le fichier clients restructuré (.xlsx)", type=["xlsx"])
 if not up:
-    st.info("⬆️ Charge le fichier **CLIENTS_HYMPYR_restructure.xlsx** pour démarrer.")
+    st.info("⬆️ Charge le fichier **CLIENTS_HYMPYR.xlsx** pour démarrer.")
     st.stop()
 
 clients, adresses = lire_fichier(up.getvalue())

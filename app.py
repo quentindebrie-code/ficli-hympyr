@@ -50,6 +50,21 @@ MOTIFS_SORTIE = [
     "Injoignable définitivement", "Autre",
 ]
 
+# Deadline réglementaire (émission de la facturation électronique pour les PME)
+DEADLINE = dt.date(2027, 9, 1)
+
+def jours_ouvres(debut: dt.date, fin: dt.date) -> int:
+    """Nombre de jours ouvrés (lun-ven) entre deux dates, fin exclue."""
+    if fin <= debut:
+        return 0
+    n = 0
+    d = debut
+    while d < fin:
+        if d.weekday() < 5:  # 0=lundi … 4=vendredi
+            n += 1
+        d += dt.timedelta(days=1)
+    return n
+
 st.set_page_config(page_title="Cockpit appels — Hympyr", page_icon="📞", layout="wide")
 
 # Compteur de modifications depuis le dernier export (garde-fou anti-perte)
@@ -384,7 +399,7 @@ def preparer_export_adresses(suivi_adr: pd.DataFrame, adresses_df: pd.DataFrame)
 # ─────────────────────────────────────────────────────────────────────────────
 # EN-TÊTE
 # ─────────────────────────────────────────────────────────────────────────────
-st.title("Suivi client - MAJ fichier client")
+st.title("📞 Cockpit de campagne d'appels — Hympyr Énergies")
 st.caption("Outil de pilotage. La mise à jour des données se fait dans Logimatique ; "
            "cet outil suit l'avancement et donne le bon ordre d'appel.")
 
@@ -545,6 +560,29 @@ with st.sidebar:
                 st.metric("Fin estimée", fin.strftime("%d/%m/%Y"))
                 if rythme < 1:
                     st.warning("Rythme très faible : la projection est indicative.")
+
+    # ── OBJECTIF JOURNALIER POUR TENIR LA DEADLINE ──
+    st.divider()
+    st.caption(f"Objectif pour le {DEADLINE.strftime('%d/%m/%Y')}")
+    jo = jours_ouvres(dt.date.today(), DEADLINE)
+    if jo <= 0:
+        st.error("Deadline atteinte ou dépassée.")
+    else:
+        objectif = -(-reste // jo)  # arrondi supérieur
+        st.metric("Jours ouvrés restants", f"{jo}")
+        st.metric("À traiter / jour pour tenir", f"{objectif}")
+        # comparaison avec le rythme observé
+        try:
+            rythme_obs = rythme  # défini si des appels ont été faits
+        except NameError:
+            rythme_obs = None
+        if rythme_obs:
+            if rythme_obs >= objectif:
+                st.success(f"Rythme actuel ({rythme_obs:.0f}/j) ≥ objectif. Dans les temps. ✅")
+            else:
+                manque = objectif - rythme_obs
+                st.error(f"Rythme actuel ({rythme_obs:.0f}/j) sous l'objectif "
+                         f"de ~{manque:.0f}/j. Il faut accélérer ou renforcer l'équipe.")
 
     st.divider()
     st.header("🔎 Accès direct")
@@ -783,6 +821,62 @@ with onglet_dash:
     if nb > 0:
         st.warning(f"🔔 Sauvegarde du soir : tu as {nb} modification(s) à exporter. "
                    f"Télécharge les CSV ci-dessous **avant de fermer l'onglet**.")
+    st.subheader("🎯 Objectif pour tenir la deadline")
+    st.caption(f"Échéance : émission de la facturation électronique au "
+               f"{DEADLINE.strftime('%d/%m/%Y')} (PME).")
+
+    perimetre = st.radio(
+        "Périmètre à boucler pour la deadline",
+        ["Tous les clients restants", "Uniquement les pros (conformité)"],
+        horizontal=True,
+    )
+    if perimetre.startswith("Uniquement"):
+        masque_perim = base["Type client"].str.startswith("Pro")
+    else:
+        masque_perim = pd.Series(True, index=base.index)
+    restant_perim = int((masque_perim & ~base["statut"].isin(STATUTS_TERMINES)).sum())
+
+    jo = jours_ouvres(dt.date.today(), DEADLINE)
+    o1, o2, o3, o4 = st.columns(4)
+    o1.metric("Restant sur ce périmètre", f"{restant_perim:,}".replace(",", " "))
+    o2.metric("Jours ouvrés d'ici la deadline", f"{jo}")
+    if jo > 0:
+        objectif = -(-restant_perim // jo)
+        o3.metric("À traiter / jour", f"{objectif}")
+        # rythme observé
+        s_tmp = charger_suivi()
+        rythme_obs = None
+        if not s_tmp.empty and s_tmp["maj_le"].notna().any():
+            s_tmp["jour"] = pd.to_datetime(s_tmp["maj_le"], errors="coerce").dt.date
+            term = s_tmp[s_tmp["statut"].isin(STATUTS_TERMINES)]
+            ja = term["jour"].nunique()
+            if ja > 0:
+                rythme_obs = len(term) / ja
+        if rythme_obs:
+            o4.metric("Rythme actuel / jour", f"{rythme_obs:.0f}",
+                      delta=f"{rythme_obs - objectif:+.0f} vs objectif")
+            if rythme_obs >= objectif:
+                st.success(f"✅ Au rythme actuel ({rythme_obs:.0f}/jour), la deadline est tenable "
+                           f"sur ce périmètre.")
+            else:
+                jours_necessaires = -(-restant_perim // max(int(rythme_obs), 1))
+                fin_proj = dt.date.today()
+                ajout = 0
+                while jours_necessaires > 0:
+                    fin_proj += dt.timedelta(days=1)
+                    if fin_proj.weekday() < 5:
+                        jours_necessaires -= 1
+                st.error(f"⚠️ Au rythme actuel ({rythme_obs:.0f}/jour), fin estimée vers le "
+                         f"{fin_proj.strftime('%d/%m/%Y')} — soit après la deadline. "
+                         f"Il faut viser {objectif}/jour, ou renforcer l'équipe.")
+        else:
+            o4.metric("Rythme actuel / jour", "—")
+            st.info("Le rythme s'affichera après les premiers appels enregistrés.")
+    else:
+        o3.metric("À traiter / jour", "—")
+        st.error("La deadline est atteinte ou dépassée.")
+
+    st.divider()
     st.subheader("Avancement de la campagne")
     s = charger_suivi()
     cc1, cc2, cc3, cc4 = st.columns(4)

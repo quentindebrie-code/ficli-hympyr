@@ -173,6 +173,15 @@ def charger_suivi_adresses() -> pd.DataFrame:
     return df
 
 
+def reinitialiser_tout() -> None:
+    """Efface TOUT le suivi (appels + référents). Action irréversible."""
+    con = db()
+    con.execute("DELETE FROM suivi")
+    con.execute("DELETE FROM suivi_adresses")
+    con.commit()
+    con.close()
+
+
 def _retrouver(colnames, *cibles):
     """Retrouve un nom de colonne quelle que soit la casse/les espaces."""
     norm = {str(c).strip().lower(): c for c in colnames}
@@ -399,13 +408,13 @@ def preparer_export_adresses(suivi_adr: pd.DataFrame, adresses_df: pd.DataFrame)
 # ─────────────────────────────────────────────────────────────────────────────
 # EN-TÊTE
 # ─────────────────────────────────────────────────────────────────────────────
-st.title("Suivi de la mise à jour du fichier clients Hympyr Energies")
+st.title("📞 Cockpit de campagne d'appels — Hympyr Énergies")
 st.caption("Outil de pilotage. La mise à jour des données se fait dans Logimatique ; "
            "cet outil suit l'avancement et donne le bon ordre d'appel.")
 
 up = st.file_uploader("Charger le fichier clients restructuré (.xlsx)", type=["xlsx"])
 if not up:
-    st.info("⬆️ Charge le fichier **CLIENTS_HYMPYR.xlsx** pour démarrer.")
+    st.info("⬆️ Charge le fichier **CLIENTS_HYMPYR_restructure.xlsx** pour démarrer.")
     st.stop()
 
 clients, adresses = lire_fichier(up.getvalue())
@@ -594,6 +603,21 @@ with st.sidebar:
     f_acompl = st.checkbox("Uniquement « À compléter » non vide", value=False)
     recherche = st.text_input("Recherche (nom, code, ville)")
     prio = st.checkbox("Trier par priorité (pros d'abord)", value=True)
+
+    st.divider()
+    with st.expander("⚙️ Réinitialisation (zone sensible)"):
+        st.caption("Efface **tout** le suivi : appels ET référents. "
+                   "Action irréversible. Pense à exporter tes CSV avant, par sécurité.")
+        confirme = st.checkbox("Je comprends que tout sera effacé sans retour possible")
+        code_confirm = st.text_input("Pour confirmer, écris RESET ci-dessous", value="")
+        if st.button("🗑️ Tout réinitialiser", disabled=not (confirme and code_confirm.strip().upper() == "RESET")):
+            reinitialiser_tout()
+            st.session_state.modifs_non_sauvees = 0
+            for k in ("idx", "idx_adr"):
+                st.session_state.pop(k, None)
+            st.cache_data.clear()
+            st.success("Tout a été réinitialisé. L'outil repart d'une base vierge.")
+            st.rerun()
 
 
 # ─────────────────────────────────────────────────────────────────────────────

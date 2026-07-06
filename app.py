@@ -1,22 +1,3 @@
-# -*- coding: utf-8 -*-
-"""
-HYMPYR ÉNERGIES — Cockpit de campagne d'appels clients
-------------------------------------------------------
-Outil de PILOTAGE (mono-utilisateur). La saisie des données reste faite
-directement dans Logimatique ; cet outil ne fait que :
-  - présenter une liste d'appels priorisée et dédoublonnée,
-  - afficher une fiche complète par client (+ ses adresses de livraison),
-  - capturer le résultat de chaque appel (existence, produits, statut, notes),
-  - suivre l'avancement et projeter une date de fin réaliste.
-
-Le fichier client n'est jamais modifié. L'état des appels est stocké
-localement dans une petite base SQLite (suivi_appels.db), à côté du script.
-
-Lancement :
-    pip install streamlit pandas openpyxl
-    streamlit run app.py
-"""
-
 import io
 import sqlite3
 import datetime as dt

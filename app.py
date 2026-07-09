@@ -722,26 +722,38 @@ with onglet_appel:
     with droite:
         st.markdown("#### Résultat de l'appel")
         prod_init = [p for p in str(row.get("produits") or "").split("|") if p in PRODUITS]
+        # IMPORTANT : chaque widget porte une key incluant le code client.
+        # Streamlit crée alors un widget neuf par fiche, réinitialisé à partir des
+        # données de la ligne. Sans ces keys, l'état d'une fiche « débordait » sur
+        # la suivante (les saisies ne se remettaient pas à zéro).
         with st.form("appel", clear_on_submit=False):
             statut = st.selectbox("Statut", STATUTS,
-                                  index=STATUTS.index(row["statut"]) if row["statut"] in STATUTS else 0)
+                                  index=STATUTS.index(row["statut"]) if row["statut"] in STATUTS else 0,
+                                  key=f"statut_{code}")
             existe = st.radio("Client toujours actif ?", ["Oui", "Non", "Incertain"],
                               horizontal=True,
                               index=["Oui", "Non", "Incertain"].index(row.get("existe") or "Oui")
-                              if (row.get("existe") in ["Oui", "Non", "Incertain"]) else 0)
-            produits = st.multiselect("Produits achetés", PRODUITS, default=prod_init)
-            email_maj = st.text_input("E-mail confirmé / corrigé", value=row.get("email_maj") or "")
-            tel_maj = st.text_input("Téléphone confirmé / corrigé", value=row.get("tel_maj") or "")
+                              if (row.get("existe") in ["Oui", "Non", "Incertain"]) else 0,
+                              key=f"existe_{code}")
+            produits = st.multiselect("Produits achetés", PRODUITS, default=prod_init,
+                                      key=f"produits_{code}")
+            email_maj = st.text_input("E-mail confirmé / corrigé", value=row.get("email_maj") or "",
+                                      key=f"email_{code}")
+            tel_maj = st.text_input("Téléphone confirmé / corrigé", value=row.get("tel_maj") or "",
+                                    key=f"tel_{code}")
             doublon_de = st.text_input("Doublon du client n°", value=row.get("doublon_de") or "",
-                                       help="Si ce client est un doublon, indiquer le code à conserver.")
+                                       help="Si ce client est un doublon, indiquer le code à conserver.",
+                                       key=f"doublon_{code}")
             motif_sortie = st.selectbox(
                 "Motif de sortie (si ancien client)", MOTIFS_SORTIE,
                 index=MOTIFS_SORTIE.index(row.get("motif_sortie"))
                 if (row.get("motif_sortie") in MOTIFS_SORTIE) else 0,
-                help="À renseigner si le statut est « Ancien client (à sortir) »."
-            )
-            rappel = st.date_input("Date de rappel (si applicable)", value=None)
-            note = st.text_area("Notes (commercial, vérifs…)", value=row.get("note") or "", height=90)
+                help="À renseigner si le statut est « Ancien client (à sortir) ».",
+                key=f"motif_{code}")
+            rappel = st.date_input("Date de rappel (si applicable)", value=None,
+                                   key=f"rappel_{code}")
+            note = st.text_area("Notes (commercial, vérifs…)", value=row.get("note") or "", height=90,
+                                key=f"note_{code}")
             ok = st.form_submit_button("💾 Enregistrer & passer au suivant",
                                        use_container_width=True, type="primary")
         if ok:
@@ -827,13 +839,19 @@ with onglet_adr:
                     </div>""", unsafe_allow_html=True)
             with d:
                 st.markdown("#### Référent du site")
+                # Même logique que la fiche client : une key par code adresse pour que
+                # chaque point de livraison réinitialise son formulaire.
                 with st.form("adr_form"):
-                    referent = st.text_input("Nom du référent sur place", value=a.get("referent") or "")
-                    tel_site = st.text_input("Téléphone du site / référent", value=a.get("tel_site") or "")
+                    referent = st.text_input("Nom du référent sur place", value=a.get("referent") or "",
+                                             key=f"referent_{cad}")
+                    tel_site = st.text_input("Téléphone du site / référent", value=a.get("tel_site") or "",
+                                             key=f"tel_site_{cad}")
                     statut_adr = st.selectbox("Statut", ["À vérifier", "Vérifié ✅", "Adresse obsolète"],
                         index=["À vérifier","Vérifié ✅","Adresse obsolète"].index(a["statut_adr"])
-                        if a["statut_adr"] in ["À vérifier","Vérifié ✅","Adresse obsolète"] else 0)
-                    note_adr = st.text_area("Note", value=a.get("note_adr") or "", height=80)
+                        if a["statut_adr"] in ["À vérifier","Vérifié ✅","Adresse obsolète"] else 0,
+                        key=f"statut_adr_{cad}")
+                    note_adr = st.text_area("Note", value=a.get("note_adr") or "", height=80,
+                                            key=f"note_adr_{cad}")
                     ok_adr = st.form_submit_button("💾 Enregistrer & suivant",
                                                    use_container_width=True, type="primary")
                 if ok_adr:

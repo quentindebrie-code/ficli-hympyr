@@ -1,56 +1,45 @@
 """
 Cockpit appels — Hympyr Énergies
-================================
+=================================
 
-Outil de pilotage de la campagne d'appels clients : file d'appel priorisée,
-saisie du résultat, suivi des points de livraison, tableau de bord et exports.
+Outil de pilotage de la campagne d'appels clients, en équipe.
 
-CE QUI A CHANGÉ PAR RAPPORT À LA VERSION PRÉCÉDENTE
----------------------------------------------------
-1. Le fichier client ne vit plus dans st.session_state mais dans un cache de
-   ressource partagé par le processus. Une déconnexion du navigateur (veille de
-   l'ordinateur, onglet en arrière-plan pendant un appel, changement de réseau)
-   ne fait plus réapparaître l'écran de téléversement.
+TROIS PROFILS
+-------------
+  Chloé, Patricia  — commerciales : appels clients, points de livraison, export.
+  Mika             — manager      : tableau de bord uniquement.
 
-2. Le compteur « modifications non sauvegardées » est calculé depuis la base et
-   non depuis la session. Il ne repasse plus au vert tout seul après une
-   déconnexion — c'était le pire cas : croire son travail sauvegardé.
+CE QUI PERMET DE TRAVAILLER À PLUSIEURS SANS SE MARCHER DESSUS
+--------------------------------------------------------------
+1. Chaque enregistrement porte le nom de qui l'a fait (colonne traite_par).
+   Une pastille colorée l'affiche à côté du nom du client.
+2. Un verrou de consultation signale en temps réel qu'une collègue est déjà sur
+   la fiche, avec depuis combien de temps. Il n'interdit rien : il informe, ce
+   qui suffit à éviter le double appel.
+3. Des filtres « non traités / traités par Chloé / traités par Patricia »
+   permettent à chacune de se réserver une portion de la file.
+4. Le tableau de bord du manager est alimenté directement par l'activité des
+   deux commerciales, sans ressaisie.
 
-3. SQLite est configuré en mode WAL avec un délai d'attente, pour supporter
-   plusieurs onglets ou utilisateurs simultanés sans « database is locked ».
+PERSISTANCE
+-----------
+La base SQLite est écrite dans DOSSIER_DONNEES. Sur une plateforme à système de
+fichiers éphémère, ce disque est perdu à chaque redémarrage du conteneur : les
+exports du soir restent alors la seule sauvegarde. Définir la variable
+d'environnement HYMPYR_DATA_DIR vers un volume persistant pour fermer le sujet.
 
-4. La position dans la file (fiche en cours) est mémorisée en base : après une
-   reconnexion, on reprend là où on s'était arrêté.
+DONNÉES PERSONNELLES
+--------------------
+Cet outil traite noms, adresses, téléphones et e-mails de clients : information
+classifiée C2. Hébergement et plateforme doivent être instruits en conséquence,
+et l'application inscrite au registre des applications.
 
-5. Correction d'une perte de données : à l'import d'une sauvegarde, les dates de
-   rappel étaient systématiquement écrasées. Elles sont désormais relues et
-   reconverties.
-
-6. Plus aucun st.stop() dans un onglet : une file vide n'empêche plus d'accéder
-   au tableau de bord et aux exports.
-
-7. Sauvegarde automatique optionnelle : un fichier CSV est écrit à chaque
-   enregistrement dans un dossier de sauvegarde, en plus des exports manuels.
-
-POINT DE VIGILANCE — PERSISTANCE
---------------------------------
-La base SQLite est écrite sur le disque local. Si l'application tourne sur une
-plateforme à système de fichiers éphémère (Streamlit Community Cloud par
-exemple), ce disque est perdu à chaque redémarrage du conteneur. L'export du
-soir reste alors la seule sauvegarde. Voir la variable DOSSIER_DONNEES pour
-pointer vers un volume persistant.
-
-POINT DE VIGILANCE — DONNÉES PERSONNELLES
------------------------------------------
-Cet outil traite des noms, adresses, téléphones et adresses e-mail de clients :
-information classifiée C2. Hébergement et plateforme doivent être instruits en
-conséquence, et l'application inscrite au registre des applications.
-
-Dépendances : streamlit >= 1.30, pandas >= 2.0, openpyxl >= 3.1
+Dépendances : streamlit >= 1.31, pandas >= 2.0, openpyxl >= 3.1
 """
 
 from __future__ import annotations
 
+import hashlib
 import io
 import os
 import re
@@ -67,8 +56,6 @@ import streamlit as st
 # CONFIGURATION
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Dossier des données. Pour un hébergement avec volume persistant, définir la
-# variable d'environnement HYMPYR_DATA_DIR vers ce volume.
 DOSSIER_DONNEES = Path(os.environ.get("HYMPYR_DATA_DIR", Path(__file__).parent))
 DOSSIER_DONNEES.mkdir(parents=True, exist_ok=True)
 
@@ -76,7 +63,34 @@ DB_PATH = DOSSIER_DONNEES / "suivi_appels.db"
 DOSSIER_SAUVEGARDES = DOSSIER_DONNEES / "sauvegardes"
 DOSSIER_SAUVEGARDES.mkdir(parents=True, exist_ok=True)
 
-VERT, VERT_FONCE, ORANGE = "#1A6B45", "#0D3D27", "#FF5C29"
+VERT, VERT_FONCE, ORANGE, GRIS = "#1A6B45", "#0D3D27", "#FF5C29", "#8E9A94"
+
+# ── Comptes ──────────────────────────────────────────────────────────────────
+# Les mots de passe ne figurent jamais en clair : seule leur empreinte SHA-256
+# salée est stockée. Pour changer un mot de passe, recalculer l'empreinte avec
+# empreinte("nouveau_mot_de_passe") et remplacer la valeur ci-dessous.
+# En production, préférer st.secrets — voir charger_empreinte().
+SEL = "hympyr-cockpit-2026"
+
+PROFILS = {
+    "Chloé": {
+        "role": "commercial",
+        "couleur": VERT,
+        "empreinte": "3eb1540ff1bcc49460df5b6df9b6e650ec4b49c69b269c56f968123164aa3a3b",
+    },
+    "Patricia": {
+        "role": "commercial",
+        "couleur": ORANGE,
+        "empreinte": "ddff2e48a6a2eb29792cec7c7bf4f7cac6694b737dffa4ec6a8e9b52a0547766",
+    },
+    "Mika": {
+        "role": "manager",
+        "couleur": VERT_FONCE,
+        "empreinte": "e97cafd6d1baa1ede105c0811b8e26d144505b1cb49d9107f720e6d424202a47",
+    },
+}
+
+COMMERCIALES = [nom for nom, p in PROFILS.items() if p["role"] == "commercial"]
 
 PRODUITS = [
     "GNR", "Gasoil routier", "Sans plomb", "AdBlue",
@@ -88,7 +102,6 @@ STATUTS = [
     "Fait ✅", "Doublon", "Ancien client (à sortir)",
 ]
 STATUTS_TERMINES = {"Fait ✅", "Doublon", "Ancien client (à sortir)"}
-
 STATUTS_ADRESSE = ["À vérifier", "Vérifié ✅", "Adresse obsolète"]
 
 MOTIFS_SORTIE = [
@@ -99,6 +112,13 @@ MOTIFS_SORTIE = [
 
 # Échéance : obligation d'émission de la facturation électronique pour les PME.
 DEADLINE = dt.date(2027, 9, 1)
+
+# Durée pendant laquelle un verrou de consultation reste considéré comme actif.
+VERROU_MINUTES = 12
+
+# Libellés d'affichage utilisés dans les exports pour une valeur vide.
+# À l'import, ils doivent redevenir une chaîne vide.
+LIBELLES_VIDES = {"Non traité", "Non traitée", "Non vérifié", "Non vérifiée", "—", "-"}
 
 st.set_page_config(page_title="Cockpit appels — Hympyr", page_icon="📞", layout="wide")
 
@@ -111,8 +131,15 @@ st.markdown(
   .fiche {{ background:#f6faf7; border:1px solid #d1e8da; border-left:5px solid {VERT};
            border-radius:10px; padding:16px 20px; margin-bottom:12px; }}
   .pill {{ display:inline-block; background:{VERT}; color:#fff; border-radius:50px;
-           padding:2px 12px; font-size:12px; font-weight:600; margin-right:6px; }}
+           padding:3px 13px; font-size:12px; font-weight:600; margin-right:6px; }}
   .pill-orange {{ background:{ORANGE}; }}
+  .pill-gris {{ background:{GRIS}; }}
+  .bandeau-verrou {{ background:#fff7ed; border:1px solid #f0c48a; border-left:5px solid {ORANGE};
+                     border-radius:10px; padding:12px 16px; margin-bottom:12px;
+                     font-size:0.92rem; color:#7c3f0a; }}
+  .demo-etape {{ background:{VERT_FONCE}; color:#fff; border-radius:10px;
+                 padding:18px 20px; margin-bottom:14px; line-height:1.6; }}
+  .demo-etape b {{ color:#8ED6AE; }}
 </style>
 """,
     unsafe_allow_html=True,
@@ -120,11 +147,28 @@ st.markdown(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# UTILITAIRES GÉNÉRAUX
+# UTILITAIRES
 # ─────────────────────────────────────────────────────────────────────────────
 
+def empreinte(mot_de_passe: str) -> str:
+    """Empreinte SHA-256 salée d'un mot de passe."""
+    return hashlib.sha256((SEL + mot_de_passe).encode("utf-8")).hexdigest()
+
+
+def charger_empreinte(nom: str) -> str:
+    """Empreinte attendue pour un profil.
+
+    st.secrets prime sur la valeur inscrite dans le code : cela permet de
+    changer un mot de passe sans modifier ni redéployer le fichier source.
+    Format attendu dans secrets.toml :  [motsdepasse]  Chloé = "empreinte…"
+    """
+    try:
+        return st.secrets["motsdepasse"][nom]
+    except Exception:
+        return PROFILS[nom]["empreinte"]
+
+
 def jours_ouvres(debut: dt.date, fin: dt.date) -> int:
-    """Nombre de jours ouvrés (lundi-vendredi) entre deux dates, fin exclue."""
     if fin <= debut:
         return 0
     n, d = 0, debut
@@ -136,7 +180,6 @@ def jours_ouvres(debut: dt.date, fin: dt.date) -> int:
 
 
 def date_apres_jours_ouvres(depart: dt.date, nb: int) -> dt.date:
-    """Date obtenue en ajoutant nb jours ouvrés à une date de départ."""
     d, restants = depart, max(0, int(nb))
     while restants > 0:
         d += dt.timedelta(days=1)
@@ -149,12 +192,11 @@ def maintenant_iso() -> str:
     return dt.datetime.now().isoformat(timespec="seconds")
 
 
-def formater_entier(n: int) -> str:
+def formater_entier(n) -> str:
     return f"{int(n):,}".replace(",", " ")
 
 
 def jolie_date(valeur, avec_heure: bool = False) -> str:
-    """Formate une date ISO en JJ/MM/AAAA, en renvoyant la valeur telle quelle si illisible."""
     texte = str(valeur or "").strip()
     if not texte:
         return ""
@@ -168,8 +210,8 @@ def jolie_date(valeur, avec_heure: bool = False) -> str:
 def vers_iso(valeur) -> str:
     """Convertit une date (JJ/MM/AAAA ou ISO) en ISO, ou chaîne vide si illisible.
 
-    Le format ISO est détecté en premier : sans cela, « 2026-09-03 » serait lu
-    en jour-mois-année et deviendrait le 9 mars.
+    Le format ISO est testé en premier : sans cela, « 2026-09-03 » serait lu en
+    jour-mois-année et deviendrait le 9 mars.
     """
     texte = str(valeur or "").strip()
     if not texte:
@@ -188,12 +230,22 @@ def vers_iso(valeur) -> str:
 
 
 def trouver_colonne(colonnes: Iterable, *cibles: str):
-    """Retrouve un nom de colonne quelle que soit la casse ou les espaces."""
     norm = {str(c).strip().lower(): c for c in colonnes}
     for cible in cibles:
         if cible in norm:
             return norm[cible]
     return None
+
+
+def pastille_traitement(traite_par: str) -> str:
+    """Pastille colorée indiquant qui a traité la fiche, grise si non traitée."""
+    nom = str(traite_par or "").strip()
+    if nom in PROFILS:
+        couleur = PROFILS[nom]["couleur"]
+        return (f"<span class='pill' style='background:{couleur}'>Traité par {nom}</span>")
+    if nom:
+        return f"<span class='pill pill-gris'>Traité par {nom}</span>"
+    return "<span class='pill pill-gris'>Non traité</span>"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -202,10 +254,10 @@ def trouver_colonne(colonnes: Iterable, *cibles: str):
 
 @contextmanager
 def connexion():
-    """Connexion SQLite configurée pour supporter plusieurs sessions simultanées.
+    """Connexion configurée pour supporter plusieurs utilisateurs simultanés.
 
-    WAL autorise des lectures pendant une écriture ; busy_timeout évite l'erreur
-    « database is locked » lorsque deux onglets enregistrent en même temps.
+    WAL autorise les lectures pendant une écriture ; busy_timeout évite l'erreur
+    « database is locked » quand deux personnes enregistrent en même temps.
     """
     con = sqlite3.connect(DB_PATH, timeout=30, check_same_thread=False)
     try:
@@ -223,45 +275,40 @@ def initialiser_base() -> None:
         con.execute("""
             CREATE TABLE IF NOT EXISTS suivi (
                 code_client   TEXT PRIMARY KEY,
-                statut        TEXT,
-                existe        TEXT,
-                produits      TEXT,
-                email_maj     TEXT,
-                tel_maj       TEXT,
-                note          TEXT,
-                doublon_de    TEXT,
-                rappel_date   TEXT,
-                motif_sortie  TEXT,
-                maj_le        TEXT
+                statut        TEXT, existe TEXT, produits TEXT,
+                email_maj     TEXT, tel_maj TEXT, note TEXT,
+                doublon_de    TEXT, rappel_date TEXT, motif_sortie TEXT,
+                traite_par    TEXT, maj_le TEXT
             )
         """)
         con.execute("""
             CREATE TABLE IF NOT EXISTS suivi_adresses (
                 code_adresse  TEXT PRIMARY KEY,
-                referent      TEXT,
-                tel_site      TEXT,
-                statut_adr    TEXT,
-                note_adr      TEXT,
-                maj_le        TEXT
+                referent      TEXT, tel_site TEXT, statut_adr TEXT,
+                note_adr      TEXT, traite_par TEXT, maj_le TEXT
             )
         """)
-        # Table technique : dernier export, dernière position dans la file, etc.
+        con.execute("CREATE TABLE IF NOT EXISTS meta (cle TEXT PRIMARY KEY, valeur TEXT)")
         con.execute("""
-            CREATE TABLE IF NOT EXISTS meta (
-                cle    TEXT PRIMARY KEY,
-                valeur TEXT
+            CREATE TABLE IF NOT EXISTS verrous (
+                cle        TEXT PRIMARY KEY,
+                type_fiche TEXT,
+                code       TEXT,
+                utilisateur TEXT,
+                depuis     TEXT
             )
         """)
-        # Migrations : colonnes ajoutées après coup sur une base existante.
+        # Migrations sur base existante
         for table, colonnes in (
-            ("suivi", ("motif_sortie", "rappel_date")),
-            ("suivi_adresses", ()),
+            ("suivi", ("motif_sortie", "rappel_date", "traite_par")),
+            ("suivi_adresses", ("traite_par",)),
         ):
             existantes = {r[1] for r in con.execute(f"PRAGMA table_info({table})").fetchall()}
             for c in colonnes:
                 if c not in existantes:
                     con.execute(f"ALTER TABLE {table} ADD COLUMN {c} TEXT")
         con.execute("CREATE INDEX IF NOT EXISTS idx_suivi_maj ON suivi(maj_le)")
+        con.execute("CREATE INDEX IF NOT EXISTS idx_suivi_qui ON suivi(traite_par)")
         con.execute("CREATE INDEX IF NOT EXISTS idx_adr_maj ON suivi_adresses(maj_le)")
 
 
@@ -285,18 +332,17 @@ def ecrire_meta(cle: str, valeur: str) -> None:
 
 def charger_suivi() -> pd.DataFrame:
     with connexion() as con:
-        df = pd.read_sql("SELECT * FROM suivi", con, dtype=str)
-    return df.fillna("")
+        return pd.read_sql("SELECT * FROM suivi", con, dtype=str).fillna("")
 
 
 def charger_suivi_adresses() -> pd.DataFrame:
     with connexion() as con:
-        df = pd.read_sql("SELECT * FROM suivi_adresses", con, dtype=str)
-    return df.fillna("")
+        return pd.read_sql("SELECT * FROM suivi_adresses", con, dtype=str).fillna("")
 
 
-def enregistrer(code: str, **champs) -> None:
+def enregistrer(code: str, utilisateur: str, **champs) -> None:
     champs["code_client"] = str(code)
+    champs["traite_par"] = utilisateur
     champs["maj_le"] = maintenant_iso()
     cols = ",".join(champs)
     ph = ",".join("?" for _ in champs)
@@ -309,8 +355,9 @@ def enregistrer(code: str, **champs) -> None:
         )
 
 
-def enregistrer_adresse(code_adresse: str, **champs) -> None:
+def enregistrer_adresse(code_adresse: str, utilisateur: str, **champs) -> None:
     champs["code_adresse"] = str(code_adresse)
+    champs["traite_par"] = utilisateur
     champs["maj_le"] = maintenant_iso()
     cols = ",".join(champs)
     ph = ",".join("?" for _ in champs)
@@ -324,11 +371,6 @@ def enregistrer_adresse(code_adresse: str, **champs) -> None:
 
 
 def nb_modifs_depuis_export() -> int:
-    """Nombre d'enregistrements postérieurs au dernier export confirmé.
-
-    Calculé depuis la base, et non depuis la session : une déconnexion du
-    navigateur ne peut plus faire croire à tort que tout est sauvegardé.
-    """
     ref = lire_meta("dernier_export", "1970-01-01T00:00:00")
     with connexion() as con:
         n = con.execute("SELECT COUNT(*) FROM suivi WHERE maj_le > ?", (ref,)).fetchone()[0]
@@ -336,44 +378,84 @@ def nb_modifs_depuis_export() -> int:
     return int(n)
 
 
-def reinitialiser_tout() -> None:
-    """Efface tout le suivi (appels, référents et position). Irréversible."""
+def base_est_vide() -> bool:
     with connexion() as con:
-        con.execute("DELETE FROM suivi")
-        con.execute("DELETE FROM suivi_adresses")
-        con.execute("DELETE FROM meta")
+        n = con.execute("SELECT COUNT(*) FROM suivi").fetchone()[0]
+    return n == 0
+
+
+def reinitialiser_tout() -> None:
+    with connexion() as con:
+        for t in ("suivi", "suivi_adresses", "meta", "verrous"):
+            con.execute(f"DELETE FROM {t}")
+
+
+# ── Verrous de consultation ──────────────────────────────────────────────────
+
+def poser_verrou(type_fiche: str, code: str, utilisateur: str) -> None:
+    """Signale que cette personne regarde cette fiche, maintenant."""
+    with connexion() as con:
+        con.execute(
+            "INSERT INTO verrous (cle, type_fiche, code, utilisateur, depuis) VALUES (?,?,?,?,?) "
+            "ON CONFLICT(cle) DO UPDATE SET utilisateur=excluded.utilisateur, depuis=excluded.depuis",
+            (f"{type_fiche}:{code}:{utilisateur}", type_fiche, str(code), utilisateur, maintenant_iso()),
+        )
+        # Purge des verrous expirés, pour que la table ne gonfle pas.
+        limite = (dt.datetime.now() - dt.timedelta(minutes=VERROU_MINUTES * 3)).isoformat(timespec="seconds")
+        con.execute("DELETE FROM verrous WHERE depuis < ?", (limite,))
+
+
+def autres_sur_la_fiche(type_fiche: str, code: str, utilisateur: str) -> list[tuple[str, int]]:
+    """Qui d'autre regarde cette fiche, et depuis combien de minutes."""
+    limite = (dt.datetime.now() - dt.timedelta(minutes=VERROU_MINUTES)).isoformat(timespec="seconds")
+    with connexion() as con:
+        lignes = con.execute(
+            "SELECT utilisateur, depuis FROM verrous "
+            "WHERE type_fiche=? AND code=? AND utilisateur<>? AND depuis >= ?",
+            (type_fiche, str(code), utilisateur, limite),
+        ).fetchall()
+    resultat = []
+    for qui, depuis in lignes:
+        try:
+            minutes = int((dt.datetime.now() - dt.datetime.fromisoformat(depuis)).total_seconds() // 60)
+        except Exception:
+            minutes = 0
+        resultat.append((qui, max(0, minutes)))
+    return resultat
+
+
+def fiches_ouvertes_par_les_autres(type_fiche: str, utilisateur: str) -> set[str]:
+    """Codes actuellement consultés par quelqu'un d'autre (verrou actif)."""
+    limite = (dt.datetime.now() - dt.timedelta(minutes=VERROU_MINUTES)).isoformat(timespec="seconds")
+    with connexion() as con:
+        lignes = con.execute(
+            "SELECT code FROM verrous WHERE type_fiche=? AND utilisateur<>? AND depuis >= ?",
+            (type_fiche, utilisateur, limite),
+        ).fetchall()
+    return {str(r[0]) for r in lignes}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SAUVEGARDE AUTOMATIQUE (filet de sécurité, en plus des exports manuels)
+# SAUVEGARDE AUTOMATIQUE
 # ─────────────────────────────────────────────────────────────────────────────
 
 def sauvegarde_auto() -> None:
-    """Écrit une copie CSV du suivi à chaque enregistrement.
-
-    Ne remplace pas l'export du soir : si le système de fichiers est éphémère,
-    ce fichier disparaît avec la base. Il protège en revanche d'une corruption
-    de la base ou d'une réinitialisation accidentelle.
-    """
+    """Copie CSV du suivi à chaque enregistrement. Ne remplace pas l'export du soir."""
     try:
         jour = dt.date.today().isoformat()
-        charger_suivi().to_csv(
-            DOSSIER_SAUVEGARDES / f"suivi_{jour}.csv", index=False, sep=";", encoding="utf-8-sig"
-        )
-        charger_suivi_adresses().to_csv(
-            DOSSIER_SAUVEGARDES / f"referents_{jour}.csv", index=False, sep=";", encoding="utf-8-sig"
-        )
+        charger_suivi().to_csv(DOSSIER_SAUVEGARDES / f"suivi_{jour}.csv",
+                               index=False, sep=";", encoding="utf-8-sig")
+        charger_suivi_adresses().to_csv(DOSSIER_SAUVEGARDES / f"referents_{jour}.csv",
+                                        index=False, sep=";", encoding="utf-8-sig")
     except Exception:
-        # Une sauvegarde qui échoue ne doit jamais bloquer la saisie.
-        pass
+        pass  # une sauvegarde qui échoue ne doit jamais bloquer la saisie
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# IMPORT DES SAUVEGARDES CSV
+# IMPORT DES SAUVEGARDES
 # ─────────────────────────────────────────────────────────────────────────────
 
 def lire_csv_robuste(fichier) -> pd.DataFrame:
-    """Lit un CSV exporté par l'outil (séparateur ; et BOM UTF-8), repli sur la virgule."""
     brut = fichier.read()
     texte = brut.decode("utf-8-sig", errors="replace") if isinstance(brut, bytes) else brut.lstrip("\ufeff")
     premiere = texte.splitlines()[0] if texte.strip() else ""
@@ -394,13 +476,17 @@ def importer_suivi_clients_csv(fichier) -> int:
         "motif_sortie": trouver_colonne(df.columns, "motif_sortie", "motif de sortie"),
         "rappel_date":  trouver_colonne(df.columns, "rappel_date", "à rappeler le"),
         "note":         trouver_colonne(df.columns, "note", "notes"),
+        "traite_par":   trouver_colonne(df.columns, "traite_par", "traité par", "traitée par"),
     }
     if not m["code_client"]:
         raise ValueError("Le CSV de suivi clients doit contenir une colonne « code_client ».")
 
     def val(ligne, cle: str) -> str:
         col = m.get(cle)
-        return str(ligne[col]).strip() if col else ""
+        brut = str(ligne[col]).strip() if col else ""
+        # « Non traité » / « Non vérifié » sont des libellés d'affichage de
+        # l'export : ils ne doivent pas revenir en base comme un nom de personne.
+        return "" if brut in LIBELLES_VIDES else brut
 
     n = 0
     for _, ligne in df.iterrows():
@@ -411,6 +497,7 @@ def importer_suivi_clients_csv(fichier) -> int:
         produits = "|".join(x.strip() for x in produits.split(",") if x.strip())
         enregistrer(
             code,
+            utilisateur=val(ligne, "traite_par"),   # on conserve l'auteur d'origine
             statut=val(ligne, "statut") or "À appeler",
             existe=val(ligne, "existe"),
             produits=produits,
@@ -419,7 +506,6 @@ def importer_suivi_clients_csv(fichier) -> int:
             doublon_de=val(ligne, "doublon_de"),
             motif_sortie=val(ligne, "motif_sortie"),
             note=val(ligne, "note"),
-            # Correction : la date de rappel était écrasée à chaque restauration.
             rappel_date=vers_iso(val(ligne, "rappel_date")),
         )
         n += 1
@@ -434,21 +520,30 @@ def importer_suivi_adresses_csv(fichier) -> int:
         "tel_site":     trouver_colonne(df.columns, "tel_site", "tél. référent / site", "tel. référent / site"),
         "statut_adr":   trouver_colonne(df.columns, "statut_adr", "statut vérification"),
         "note_adr":     trouver_colonne(df.columns, "note_adr", "note"),
+        "traite_par":   trouver_colonne(df.columns, "traite_par", "vérifié par", "traité par"),
     }
     if not m["code_adresse"]:
         raise ValueError("Le CSV des référents doit contenir une colonne « code_adresse ».")
 
     def val(ligne, cle: str) -> str:
         col = m.get(cle)
-        return str(ligne[col]).strip() if col else ""
+        brut = str(ligne[col]).strip() if col else ""
+        return "" if brut in LIBELLES_VIDES else brut
 
     n = 0
     for _, ligne in df.iterrows():
         code = val(ligne, "code_adresse")
         if not code:
             continue
+        # Une ligne sans aucune saisie ne crée pas d'enregistrement : l'export
+        # des points de livraison contient tous les sites du fichier mère,
+        # y compris ceux que personne n'a encore vérifiés.
+        if not any(val(ligne, c) for c in ("referent", "tel_site", "note_adr", "traite_par")) \
+                and val(ligne, "statut_adr") in ("", "À vérifier"):
+            continue
         enregistrer_adresse(
             code,
+            utilisateur=val(ligne, "traite_par"),
             referent=val(ligne, "referent"),
             tel_site=val(ligne, "tel_site"),
             statut_adr=val(ligne, "statut_adr") or "À vérifier",
@@ -459,19 +554,19 @@ def importer_suivi_adresses_csv(fichier) -> int:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# FICHIER CLIENT — conservé au niveau du processus, pas de la session
+# FICHIER MÈRE — conservé au niveau du processus, pas de la session
 # ─────────────────────────────────────────────────────────────────────────────
 
 @st.cache_resource(show_spinner=False)
 def coffre_fichier() -> dict:
     """Conteneur partagé par toutes les sessions du processus.
 
-    C'est la correction principale du symptôme « l'outil se réinitialise tout
-    seul » : st.session_state est détruit dès que le websocket tombe (veille de
-    l'ordinateur, onglet en arrière-plan, changement de réseau), alors qu'un
-    cache de ressource survit à la reconnexion.
+    st.session_state est détruit dès que le websocket tombe (mise en veille,
+    onglet en arrière-plan, changement de réseau) ; un cache de ressource
+    survit à la reconnexion. C'est ce qui évite que l'outil « se réinitialise
+    tout seul ».
     """
-    return {"contenu": None, "nom": "", "charge_le": ""}
+    return {"contenu": None, "nom": "", "charge_le": "", "restaure": False}
 
 
 @st.cache_data(show_spinner=False)
@@ -481,52 +576,42 @@ def lire_fichier(contenu: bytes):
     clients = pd.read_excel(xls, "Clients", dtype=str).fillna("")
     adresses = (
         pd.read_excel(xls, "Adresses livraison", dtype=str).fillna("")
-        if "Adresses livraison" in xls.sheet_names
-        else pd.DataFrame()
+        if "Adresses livraison" in xls.sheet_names else pd.DataFrame()
     )
     return clients, adresses
 
 
-def normaliser_clients(clients: pd.DataFrame) -> tuple[pd.DataFrame, str | None]:
-    """Harmonise les noms de colonnes attendus par le reste de l'outil."""
+def normaliser_clients(clients: pd.DataFrame):
     col_code = trouver_colonne(clients.columns, "code client", "code_client")
     if col_code is None:
         return clients, None
 
     renoms = {}
-    correspondances = [
+    for sources, cible in [
         (("raison sociale / nom", "nom", "raison sociale"), "Raison sociale / Nom"),
         (("type client", "type"), "Type client"),
         (("ville",), "Ville"),
         (("catégorie normalisée", "catégorie", "categorie"), "Catégorie"),
         (("siren (9 chiffres)", "siren", "siren / siret"), "SIREN"),
         (("code postal", "code_postal"), "Code postal"),
-    ]
-    for sources, cible in correspondances:
+    ]:
         col = trouver_colonne(clients.columns, *sources)
         if col and col != cible:
             renoms[col] = cible
-
     for n in (1, 2, 3):
         col = trouver_colonne(clients.columns, f"téléphone {n} (norm)", f"téléphone {n}", f"telephone {n}")
         if col and col != f"Téléphone {n}":
             renoms[col] = f"Téléphone {n}"
-
     if renoms:
         clients = clients.rename(columns=renoms)
-    # Le renommage peut créer des doublons de noms : on garde la première
-    # occurrence, qui correspond à la version nettoyée.
     clients = clients.loc[:, ~clients.columns.duplicated(keep="first")]
 
-    for c in [
-        "Raison sociale / Nom", "Type client", "Ville", "Catégorie", "À compléter",
-        "Email principal", "Email secondaire", "SIREN",
-        "Téléphone 1", "Téléphone 2", "Téléphone 3",
-        "Adresse 1", "Adresse 2", "Adresse 3", "Code postal",
-    ]:
+    for c in ["Raison sociale / Nom", "Type client", "Ville", "Catégorie", "À compléter",
+              "Email principal", "Email secondaire", "SIREN",
+              "Téléphone 1", "Téléphone 2", "Téléphone 3",
+              "Adresse 1", "Adresse 2", "Adresse 3", "Code postal"]:
         if c not in clients.columns:
             clients[c] = ""
-
     return clients, col_code
 
 
@@ -571,11 +656,10 @@ def priorite(type_client: str) -> int:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# PRÉPARATION DES EXPORTS
+# EXPORTS
 # ─────────────────────────────────────────────────────────────────────────────
 
 def preparer_export(suivi_df: pd.DataFrame, base_df: pd.DataFrame, col_code: str) -> pd.DataFrame:
-    """Tableau de suivi clients, lisible dans Excel."""
     df = suivi_df.copy().fillna("")
     if df.empty:
         return df
@@ -584,15 +668,17 @@ def preparer_export(suivi_df: pd.DataFrame, base_df: pd.DataFrame, col_code: str
     infos = infos.rename(columns={col_code: "code_client"})
     df = df.merge(infos, on="code_client", how="left").fillna("")
 
-    df["produits"] = df["produits"].fillna("").str.replace("|", ", ", regex=False)
+    df["produits"] = df["produits"].str.replace("|", ", ", regex=False)
     df["rappel_date"] = df["rappel_date"].map(lambda v: jolie_date(v))
     df["maj_le"] = df["maj_le"].map(lambda v: jolie_date(v, avec_heure=True))
+    df["traite_par"] = df["traite_par"].replace("", "Non traité")
 
     colonnes = {
         "code_client": "Code client",
         "Raison sociale / Nom": "Nom / Raison sociale",
         "Ville": "Ville",
         "Type client": "Type",
+        "traite_par": "Traité par",
         "statut": "Statut de l'appel",
         "existe": "Client actif ?",
         "produits": "Produits achetés",
@@ -611,27 +697,22 @@ def preparer_export(suivi_df: pd.DataFrame, base_df: pd.DataFrame, col_code: str
 
 
 def preparer_export_adresses(suivi_adr: pd.DataFrame, adresses_df: pd.DataFrame) -> pd.DataFrame:
-    """Tableau des points de livraison et de leurs référents."""
     if adresses_df.empty:
         return pd.DataFrame()
 
-    base_adr = adresses_df.copy()
-    sortie = base_adr[["Code adresse", "Code client mère", "Nom site", "Code postal", "Ville"]].rename(
+    sortie = adresses_df[["Code adresse", "Code client mère", "Nom site", "Code postal", "Ville"]].rename(
         columns={"Nom site": "Nom du site"}
     )
-
     if suivi_adr.empty:
-        suivi_adr = pd.DataFrame(
-            columns=["code_adresse", "referent", "tel_site", "statut_adr", "note_adr", "maj_le"]
-        )
-    sortie = sortie.merge(
-        suivi_adr, left_on="Code adresse", right_on="code_adresse", how="left"
-    ).fillna("")
-
+        suivi_adr = pd.DataFrame(columns=["code_adresse", "referent", "tel_site",
+                                          "statut_adr", "note_adr", "traite_par", "maj_le"])
+    sortie = sortie.merge(suivi_adr, left_on="Code adresse", right_on="code_adresse", how="left").fillna("")
     sortie["maj_le"] = sortie.get("maj_le", "").map(lambda v: jolie_date(v, avec_heure=True))
     sortie["statut_adr"] = sortie.get("statut_adr", "").replace("", "À vérifier")
+    sortie["traite_par"] = sortie.get("traite_par", "").replace("", "Non traité")
 
     libelles = {
+        "traite_par": "Vérifié par",
         "referent": "Référent sur place",
         "tel_site": "Tél. référent / site",
         "statut_adr": "Statut vérification",
@@ -642,12 +723,11 @@ def preparer_export_adresses(suivi_adr: pd.DataFrame, adresses_df: pd.DataFrame)
         if c not in sortie.columns:
             sortie[c] = ""
     ordre = ["Code adresse", "Code client mère", "Nom du site", "Code postal", "Ville",
-             "referent", "tel_site", "statut_adr", "note_adr", "maj_le"]
+             "traite_par", "referent", "tel_site", "statut_adr", "note_adr", "maj_le"]
     return sortie[ordre].rename(columns=libelles)
 
 
 def vers_excel(df: pd.DataFrame, nom_feuille: str) -> bytes:
-    """Classeur Excel mis en forme : en-tête vert, colonnes ajustées, filtres."""
     from openpyxl.styles import Alignment, Font, PatternFill
 
     tampon = io.BytesIO()
@@ -660,114 +740,266 @@ def vers_excel(df: pd.DataFrame, nom_feuille: str) -> bytes:
             cellule.font = Font(bold=True, color="FFFFFF")
             cellule.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
             longueurs = df[col].astype(str).str.len().head(200)
-            largeur = max(len(str(col)) + 2, int(longueurs.max() or 10) + 2)
-            ws.column_dimensions[cellule.column_letter].width = min(largeur, 45)
+            ws.column_dimensions[cellule.column_letter].width = min(
+                max(len(str(col)) + 2, int(longueurs.max() or 10) + 2), 45)
         ws.freeze_panes = "A2"
         ws.auto_filter.ref = ws.dimensions
     return tampon.getvalue()
 
 
-def calculer_rythme(suivi_df: pd.DataFrame) -> float | None:
-    """Nombre moyen de fiches terminées par jour d'activité réelle."""
+# ─────────────────────────────────────────────────────────────────────────────
+# INDICATEURS
+# ─────────────────────────────────────────────────────────────────────────────
+
+def calculer_rythme(suivi_df: pd.DataFrame, utilisateur: str | None = None) -> float | None:
+    """Fiches terminées par jour d'activité réelle, globalement ou par personne."""
     if suivi_df.empty or "maj_le" not in suivi_df.columns:
         return None
     termines = suivi_df[suivi_df["statut"].isin(STATUTS_TERMINES)].copy()
+    if utilisateur:
+        termines = termines[termines["traite_par"] == utilisateur]
     if termines.empty:
         return None
     termines["jour"] = pd.to_datetime(termines["maj_le"], errors="coerce").dt.date
     jours_actifs = termines["jour"].nunique()
-    if not jours_actifs:
-        return None
-    return len(termines) / jours_actifs
+    return len(termines) / jours_actifs if jours_actifs else None
+
+
+def stats_utilisateur(suivi_df: pd.DataFrame, suivi_adr: pd.DataFrame, nom: str) -> dict:
+    """Indicateurs d'activité d'une commerciale."""
+    aujourdhui = dt.date.today()
+    s = suivi_df[suivi_df["traite_par"] == nom] if not suivi_df.empty else pd.DataFrame()
+    a = suivi_adr[suivi_adr["traite_par"] == nom] if not suivi_adr.empty else pd.DataFrame()
+
+    def du_jour(df):
+        if df.empty:
+            return 0
+        jours = pd.to_datetime(df["maj_le"], errors="coerce").dt.date
+        return int((jours == aujourdhui).sum())
+
+    return {
+        "fiches": len(s),
+        "terminees": int(s["statut"].isin(STATUTS_TERMINES).sum()) if not s.empty else 0,
+        "aujourdhui": du_jour(s),
+        "a_rappeler": int((s["statut"] == "À rappeler").sum()) if not s.empty else 0,
+        "points": len(a),
+        "points_aujourdhui": du_jour(a),
+        "rythme": calculer_rythme(suivi_df, nom),
+    }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# EN-TÊTE ET CHARGEMENT DU FICHIER
+# DÉMO GUIDÉE
 # ─────────────────────────────────────────────────────────────────────────────
 
-st.title("Suivi clients — mise à jour")
-st.caption(
-    "Outil de pilotage. La donnée de référence reste Logimatique ; "
-    "cet outil suit l'avancement et donne le bon ordre d'appel."
-)
+DEMO_COMMERCIAL = [
+    ("La colonne de gauche : votre poste de pilotage",
+     "Elle affiche <b>vos chiffres du jour</b> et l'avancement de l'équipe, puis les "
+     "<b>filtres</b> qui construisent votre file d'appel. Le filtre le plus important est "
+     "« Traitement » : choisissez <b>Non traité</b> pour ne voir que les fiches que personne "
+     "n'a encore prises. C'est ce qui vous évite d'appeler un client déjà appelé par votre collègue."),
+    ("Onglet « Appels clients » : une fiche à la fois",
+     "À gauche, les coordonnées du client. À droite, le formulaire de résultat d'appel. "
+     "Une <b>pastille colorée</b> en haut indique qui a déjà traité la fiche — grise si personne. "
+     "Si votre collègue est en train de la consulter, un <b>bandeau orange</b> vous prévient : "
+     "passez simplement à la suivante."),
+    ("Onglet « Points de livraison » : le prolongement de l'appel",
+     "Une entreprise cliente peut avoir plusieurs sites livrés. Sur la fiche client, un bloc "
+     "<b>« adresses de livraison rattachées »</b> vous les montre. "
+     "Pendant l'appel, notez le <b>référent sur place</b> pour chaque site, puis reportez-le dans "
+     "cet onglet — la recherche par <b>code client mère</b> affiche tous les points d'un même client."),
+    ("Le déroulé d'un appel, en cinq gestes",
+     "1. Filtre <b>Non traité</b> dans la colonne de gauche.<br>"
+     "2. Vous appelez le client affiché.<br>"
+     "3. Vous remplissez le formulaire de droite : statut, produits, e-mail et téléphone confirmés.<br>"
+     "4. Vous cliquez sur <b>Enregistrer & passer au suivant</b> — la fiche suivante s'ouvre seule.<br>"
+     "5. Si le client a plusieurs sites, vous complétez l'onglet <b>Points de livraison</b>."),
+    ("Onglet « Export » : à faire avant de partir",
+     "Un compteur vous indique le nombre de modifications non exportées. "
+     "En fin de journée, téléchargez les <b>deux fichiers</b> — suivi clients et points de livraison — "
+     "puis confirmez pour repasser au vert. C'est votre sauvegarde."),
+]
+
+DEMO_MANAGER = [
+    ("La colonne de gauche : la vue d'ensemble",
+     "Vous y trouvez l'avancement global de la campagne, le <b>rythme observé</b>, la projection de "
+     "fin, et l'objectif quotidien à tenir pour l'échéance de la facturation électronique. "
+     "Juste en dessous, les <b>chiffres de Chloé et de Patricia</b>, mis à jour à chaque "
+     "enregistrement de leur part."),
+    ("Tableau de bord : tenir l'échéance",
+     "Le premier bloc compare l'<b>objectif quotidien</b> au <b>rythme réel</b>. Vous pouvez "
+     "restreindre le périmètre aux seuls clients professionnels, qui sont ceux concernés par "
+     "l'obligation. Si le rythme passe sous l'objectif, une projection de fin s'affiche en rouge."),
+    ("Performance par commerciale",
+     "Un tableau et des graphiques comparent l'activité de Chloé et de Patricia : fiches traitées, "
+     "fiches du jour, rappels en cours, points de livraison vérifiés. "
+     "Ces données viennent <b>directement de leur saisie</b>, sans ressaisie ni déclaratif."),
+    ("Ce que vous voyez, et ce que vous ne voyez pas",
+     "Votre profil est en <b>lecture seule</b> : vous ne pouvez ni modifier une fiche, ni exporter "
+     "à leur place. C'est volontaire — cela garantit que les chiffres reflètent uniquement le "
+     "travail réellement effectué."),
+]
+
+
+def afficher_demo(role: str) -> None:
+    """Visite guidée en pop-up, proposée à l'ouverture de session."""
+    etapes = DEMO_COMMERCIAL if role == "commercial" else DEMO_MANAGER
+    idx = st.session_state.get("demo_etape", 0)
+    idx = max(0, min(idx, len(etapes) - 1))
+    titre, texte = etapes[idx]
+
+    def contenu():
+        st.markdown(f"<div class='demo-etape'><b>Étape {idx + 1} / {len(etapes)}</b><br><br>"
+                    f"<span style='font-size:1.05rem;font-weight:700'>{titre}</span><br><br>"
+                    f"{texte}</div>", unsafe_allow_html=True)
+        st.progress((idx + 1) / len(etapes))
+        c1, c2, c3 = st.columns([1, 1, 1])
+        if c1.button("⬅️ Précédent", disabled=(idx == 0), use_container_width=True, key="demo_prec"):
+            st.session_state.demo_etape = idx - 1
+            st.rerun()
+        if idx < len(etapes) - 1:
+            if c2.button("Suivant ➡️", type="primary", use_container_width=True, key="demo_suiv"):
+                st.session_state.demo_etape = idx + 1
+                st.rerun()
+        else:
+            if c2.button("Terminer", type="primary", use_container_width=True, key="demo_fin"):
+                st.session_state.demo_active = False
+                st.rerun()
+        if c3.button("Fermer", use_container_width=True, key="demo_close"):
+            st.session_state.demo_active = False
+            st.rerun()
+
+    if hasattr(st, "dialog"):
+        st.dialog("Visite guidée de l'outil", width="large")(contenu)()
+    else:  # repli pour les versions de Streamlit sans pop-up natif
+        with st.container(border=True):
+            st.subheader("Visite guidée de l'outil")
+            contenu()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ÉCRAN DE CONNEXION
+# ─────────────────────────────────────────────────────────────────────────────
 
 coffre = coffre_fichier()
 
-if coffre["contenu"] is None:
-    televerse = st.file_uploader("Charger le fichier clients restructuré (.xlsx)", type=["xlsx"])
-    if televerse is not None:
-        coffre["contenu"] = televerse.getvalue()
-        coffre["nom"] = televerse.name
-        coffre["charge_le"] = maintenant_iso()
-        st.rerun()
-    st.info("⬆️ Charge le fichier **CLIENTS_HYMPYR_restructure.xlsx** pour démarrer.")
+
+def ecran_connexion() -> None:
+    """Chargement des fichiers, puis choix du profil et mot de passe."""
+    st.title("Cockpit appels — Hympyr Énergies")
+
+    # ── Étape 1 : les trois fichiers ─────────────────────────────────────────
+    if coffre["contenu"] is None or not coffre["restaure"]:
+        st.subheader("1. Charger les fichiers de travail")
+        st.caption(
+            "Les trois fichiers sont nécessaires pour ouvrir une session : le fichier clients "
+            "et les deux sauvegardes exportées lors de la dernière session. "
+            "Une fois chargés, ils restent disponibles pour toute l'équipe jusqu'au redémarrage du serveur."
+        )
+
+        c1, c2, c3 = st.columns(3)
+        f_mere = c1.file_uploader("Fichier clients (.xlsx)", type=["xlsx"], key="up_mere")
+        f_suivi = c2.file_uploader("Sauvegarde SUIVI CLIENTS (.csv)", type=["csv"], key="up_suivi")
+        f_refs = c3.file_uploader("Sauvegarde RÉFÉRENTS (.csv)", type=["csv"], key="up_refs")
+
+        deja_charge = coffre["contenu"] is not None
+        if deja_charge:
+            st.success(f"Fichier clients **{coffre['nom']}** déjà en mémoire.")
+
+        # Échappatoire si la base contient déjà le travail : demander les deux
+        # sauvegardes serait alors un risque de régression, pas une sécurité.
+        reprendre = False
+        if not base_est_vide():
+            with connexion() as con:
+                nb = con.execute("SELECT COUNT(*) FROM suivi").fetchone()[0]
+            reprendre = st.checkbox(
+                f"La base contient déjà {formater_entier(nb)} fiche(s) — reprendre sans restaurer les sauvegardes",
+                help="À cocher uniquement si le travail en cours est déjà dans l'outil. "
+                     "Restaurer une sauvegarde plus ancienne écraserait les saisies récentes.",
+            )
+
+        pret = (f_mere is not None or deja_charge) and (reprendre or (f_suivi is not None and f_refs is not None))
+        if st.button("Ouvrir la session", type="primary", disabled=not pret):
+            try:
+                if f_mere is not None:
+                    coffre["contenu"] = f_mere.getvalue()
+                    coffre["nom"] = f_mere.name
+                    coffre["charge_le"] = maintenant_iso()
+                messages = []
+                if not reprendre:
+                    messages.append(f"{importer_suivi_clients_csv(f_suivi)} fiches clients restaurées")
+                    messages.append(f"{importer_suivi_adresses_csv(f_refs)} référents restaurés")
+                    ecrire_meta("dernier_export", maintenant_iso())
+                coffre["restaure"] = True
+                st.cache_data.clear()
+                if messages:
+                    st.success("✅ " + " · ".join(messages))
+                st.rerun()
+            except Exception as exc:
+                st.error(f"Chargement impossible : {exc}")
+        if not pret:
+            st.info("Charge les trois fichiers pour continuer.")
+        st.stop()
+
+    # ── Étape 2 : profil et mot de passe ─────────────────────────────────────
+    st.subheader("2. Se connecter")
+    st.caption(f"Fichier **{coffre['nom']}** chargé le {jolie_date(coffre['charge_le'], True)}.")
+
+    gauche, _ = st.columns([1, 1])
+    with gauche:
+        with st.form("connexion"):
+            nom = st.selectbox("Qui êtes-vous ?", list(PROFILS))
+            mdp = st.text_input("Mot de passe", type="password")
+            entrer = st.form_submit_button("Se connecter", type="primary", use_container_width=True)
+        if entrer:
+            if empreinte(mdp) == charger_empreinte(nom):
+                st.session_state.utilisateur = nom
+                st.session_state.role = PROFILS[nom]["role"]
+                st.session_state.demo_active = True
+                st.session_state.demo_etape = 0
+                st.rerun()
+            else:
+                st.error("Mot de passe incorrect.")
+        if st.button("📂 Charger d'autres fichiers"):
+            coffre["contenu"] = None
+            coffre["restaure"] = False
+            st.cache_data.clear()
+            st.rerun()
     st.stop()
 
-barre1, barre2, barre3 = st.columns([1.4, 1.4, 4])
-if barre1.button("🔄 Rafraîchir l'affichage", use_container_width=True,
-                 help="Recalcule l'avancement à partir de l'état enregistré, sans recharger le fichier."):
-    st.cache_data.clear()
-    st.rerun()
-if barre2.button("📂 Changer de fichier", use_container_width=True,
-                 help="Charger un autre fichier clients. Le suivi des appels n'est pas effacé."):
-    coffre["contenu"] = None
-    coffre["nom"] = ""
-    st.cache_data.clear()
-    st.rerun()
-barre3.caption(
-    f"Fichier **{coffre['nom'] or 'chargé'}** en mémoire depuis {jolie_date(coffre['charge_le'], True) or '—'}. "
-    "Il reste disponible même après une déconnexion du navigateur."
-)
+
+if "utilisateur" not in st.session_state:
+    ecran_connexion()
+
+UTILISATEUR = st.session_state.utilisateur
+ROLE = st.session_state.role
+COULEUR_MOI = PROFILS[UTILISATEUR]["couleur"]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CHARGEMENT DES DONNÉES
+# ─────────────────────────────────────────────────────────────────────────────
 
 clients_bruts, adresses_brutes = lire_fichier(coffre["contenu"])
 clients, col_code = normaliser_clients(clients_bruts)
 if col_code is None:
-    st.error(
-        "La feuille « Clients » doit contenir une colonne « Code client » "
-        f"(colonnes trouvées : {', '.join(map(str, clients_bruts.columns))})."
-    )
+    st.error("La feuille « Clients » doit contenir une colonne « Code client ».")
     st.stop()
 adresses = normaliser_adresses(adresses_brutes)
 
-
-# ── Reprise du travail de la veille ──────────────────────────────────────────
-with st.expander("🔄 Reprendre le travail de la veille (import de sauvegardes)", expanded=False):
-    st.caption(
-        "À utiliser si le suivi a été perdu, ou pour repartir d'une sauvegarde exportée. "
-        "Si tes appels d'hier sont déjà visibles dans l'avancement, tu n'as rien à faire ici."
-    )
-    imp1, imp2 = st.columns(2)
-    csv_clients = imp1.file_uploader("Sauvegarde SUIVI CLIENTS (CSV)", type=["csv"], key="imp_cli")
-    csv_referents = imp2.file_uploader("Sauvegarde RÉFÉRENTS (CSV)", type=["csv"], key="imp_adr")
-    if st.button("📥 Restaurer ces sauvegardes"):
-        messages = []
-        try:
-            if csv_clients is not None:
-                messages.append(f"{importer_suivi_clients_csv(csv_clients)} fiches clients restaurées")
-            if csv_referents is not None:
-                messages.append(f"{importer_suivi_adresses_csv(csv_referents)} référents restaurés")
-            if messages:
-                ecrire_meta("dernier_export", maintenant_iso())
-                st.success("✅ " + " · ".join(messages) + ". Tu peux reprendre où tu t'étais arrêtée.")
-                st.cache_data.clear()
-            else:
-                st.info("Aucun fichier sélectionné.")
-        except Exception as exc:
-            st.error(f"Import impossible : {exc}")
-
-
 suivi = charger_suivi()
+suivi_adr = charger_suivi_adresses()
+
 base = clients.merge(suivi, left_on=col_code, right_on="code_client", how="left")
 for c in ["statut", "existe", "produits", "email_maj", "tel_maj", "note",
-          "doublon_de", "rappel_date", "motif_sortie"]:
-    if c in base.columns:
-        base[c] = base[c].fillna("")
-    else:
-        base[c] = ""
+          "doublon_de", "rappel_date", "motif_sortie", "traite_par"]:
+    base[c] = base[c].fillna("") if c in base.columns else ""
 base["statut"] = base["statut"].replace("", "À appeler")
 base["priorite"] = base["Type client"].map(priorite)
 
 modifs_en_attente = nb_modifs_depuis_export()
+rythme_global = calculer_rythme(suivi)
+stats = {nom: stats_utilisateur(suivi, suivi_adr, nom) for nom in COMMERCIALES}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -775,16 +1007,39 @@ modifs_en_attente = nb_modifs_depuis_export()
 # ─────────────────────────────────────────────────────────────────────────────
 
 with st.sidebar:
-    if modifs_en_attente > 0:
-        st.error(
-            f"⚠️ {modifs_en_attente} modification(s) non exportée(s).\n\n"
-            "Pense à télécharger tes CSV avant de fermer (onglet Tableau de bord)."
-        )
-    else:
-        st.success("✅ Travail exporté : rien en attente.")
+    st.markdown(
+        f"<div style='background:{COULEUR_MOI};color:#fff;border-radius:10px;"
+        f"padding:12px 16px;font-weight:700;margin-bottom:12px'>"
+        f"{UTILISATEUR}<br><span style='font-weight:400;font-size:0.82rem'>"
+        f"{'Commerciale' if ROLE == 'commercial' else 'Manager'}</span></div>",
+        unsafe_allow_html=True,
+    )
+    sc1, sc2 = st.columns(2)
+    if sc1.button("🎓 Revoir la démo", use_container_width=True):
+        st.session_state.demo_active = True
+        st.session_state.demo_etape = 0
+        st.rerun()
+    if sc2.button("🚪 Déconnexion", use_container_width=True):
+        for cle in ("utilisateur", "role", "idx", "idx_adr", "demo_active", "demo_etape"):
+            st.session_state.pop(cle, None)
+        st.rerun()
+
+    if ROLE == "commercial":
+        st.divider()
+        st.header("Mes chiffres")
+        moi = stats[UTILISATEUR]
+        st.metric("Fiches traitées aujourd'hui", formater_entier(moi["aujourdhui"]))
+        st.metric("Fiches traitées au total", formater_entier(moi["fiches"]))
+        st.metric("Points de livraison vérifiés", formater_entier(moi["points"]))
+        if moi["a_rappeler"]:
+            st.info(f"⏰ {moi['a_rappeler']} rappel(s) à votre nom.")
+        if modifs_en_attente > 0:
+            st.error(f"⚠️ {modifs_en_attente} modification(s) non exportée(s) — onglet Export.")
+        else:
+            st.success("✅ Travail exporté : rien en attente.")
 
     st.divider()
-    st.header("Avancement")
+    st.header("Avancement de l'équipe")
     total = len(base)
     faits = int(base["statut"].isin(STATUTS_TERMINES).sum())
     reste = total - faits
@@ -792,15 +1047,25 @@ with st.sidebar:
     st.metric("Traités", formater_entier(faits), f"{(100 * faits / total):.1f} %" if total else "—")
     st.metric("Restants", formater_entier(reste))
 
-    rythme = calculer_rythme(suivi)
-    if rythme:
+    if ROLE == "manager":
+        st.divider()
+        st.header("Par commerciale")
+        for nom in COMMERCIALES:
+            s = stats[nom]
+            st.markdown(
+                f"<span class='pill' style='background:{PROFILS[nom]['couleur']}'>{nom}</span>",
+                unsafe_allow_html=True,
+            )
+            m1, m2 = st.columns(2)
+            m1.metric("Aujourd'hui", formater_entier(s["aujourdhui"]))
+            m2.metric("Total", formater_entier(s["fiches"]))
+
+    if rythme_global:
         st.divider()
         st.caption("Projection au rythme observé")
-        st.metric("Fiches traitées / jour actif", f"{rythme:.0f}")
-        fin_estimee = date_apres_jours_ouvres(dt.date.today(), round(reste / rythme))
-        st.metric("Fin estimée", fin_estimee.strftime("%d/%m/%Y"))
-        if rythme < 1:
-            st.warning("Rythme très faible : la projection est indicative.")
+        st.metric("Fiches / jour actif (équipe)", f"{rythme_global:.0f}")
+        st.metric("Fin estimée",
+                  date_apres_jours_ouvres(dt.date.today(), round(reste / rythme_global)).strftime("%d/%m/%Y"))
 
     st.divider()
     st.caption(f"Objectif pour le {DEADLINE.strftime('%d/%m/%Y')}")
@@ -810,55 +1075,75 @@ with st.sidebar:
     else:
         objectif = -(-reste // jo)
         st.metric("Jours ouvrés restants", str(jo))
-        st.metric("À traiter / jour pour tenir", str(objectif))
-        if rythme:
-            if rythme >= objectif:
-                st.success(f"Rythme actuel ({rythme:.0f}/j) au-dessus de l'objectif. Dans les temps.")
+        st.metric("À traiter / jour (équipe)", str(objectif))
+        if rythme_global:
+            if rythme_global >= objectif:
+                st.success(f"Rythme équipe ({rythme_global:.0f}/j) au-dessus de l'objectif.")
             else:
-                st.error(
-                    f"Rythme actuel ({rythme:.0f}/j) sous l'objectif de ~{objectif - rythme:.0f}/j. "
-                    "Il faut accélérer ou renforcer l'équipe."
-                )
+                st.error(f"Rythme équipe ({rythme_global:.0f}/j) sous l'objectif "
+                         f"de ~{objectif - rythme_global:.0f}/j.")
 
-    st.divider()
-    st.header("🔎 Accès direct")
-    code_direct = st.text_input("Code client exact", help="Tape un code client pour aller droit à sa fiche.")
+    # Filtres : uniquement pour celles qui ont une file d'appel.
+    if ROLE == "commercial":
+        st.divider()
+        st.header("🔎 Accès direct")
+        code_direct = st.text_input("Code client exact")
 
-    st.divider()
-    st.header("Filtres")
-    f_type = st.multiselect("Type de client", sorted(base["Type client"].unique()))
-    f_statut = st.multiselect("Statut d'appel", STATUTS, default=["À appeler", "À rappeler"])
-    f_acompl = st.checkbox("Uniquement « À compléter » non vide", value=False)
-    recherche = st.text_input("Recherche (nom, code, ville)")
-    tri_priorite = st.checkbox("Trier par priorité (pros d'abord)", value=True)
+        st.divider()
+        st.header("Filtres")
+        f_traitement = st.multiselect(
+            "Traitement",
+            ["Non traité"] + [f"Traité par {n}" for n in COMMERCIALES],
+            default=["Non traité"],
+            help="Le filtre qui évite les doublons : « Non traité » ne montre que les fiches "
+                 "que personne n'a encore prises.",
+        )
+        f_masquer_ouvertes = st.checkbox(
+            "Masquer les fiches ouvertes par ma collègue", value=True,
+            help=f"Une fiche consultée par quelqu'un d'autre depuis moins de {VERROU_MINUTES} minutes "
+                 "est retirée de votre file.",
+        )
+        f_type = st.multiselect("Type de client", sorted(base["Type client"].unique()))
+        f_statut = st.multiselect("Statut d'appel", STATUTS, default=["À appeler", "À rappeler"])
+        f_acompl = st.checkbox("Uniquement « À compléter » non vide", value=False)
+        recherche = st.text_input("Recherche (nom, code, ville)")
+        tri_priorite = st.checkbox("Trier par priorité (pros d'abord)", value=True)
+    else:
+        code_direct, f_traitement, f_masquer_ouvertes = "", [], False
+        f_type, f_statut, f_acompl, recherche, tri_priorite = [], [], False, "", True
 
     st.divider()
     with st.expander("⚙️ Réinitialisation (zone sensible)"):
-        st.caption(
-            "Efface tout le suivi : appels et référents. Action irréversible. "
-            "Exporte tes CSV avant, par sécurité."
-        )
-        confirme = st.checkbox("Je comprends que tout sera effacé sans retour possible")
-        mot_confirm = st.text_input("Pour confirmer, écris RESET ci-dessous", value="")
-        if st.button("🗑️ Tout réinitialiser",
-                     disabled=not (confirme and mot_confirm.strip().upper() == "RESET")):
-            reinitialiser_tout()
-            for cle in ("idx", "idx_adr"):
-                st.session_state.pop(cle, None)
-            st.cache_data.clear()
-            st.success("Suivi réinitialisé. L'outil repart d'une base vierge.")
-            st.rerun()
+        if ROLE != "manager":
+            st.caption("Réservé au profil manager.")
+        else:
+            st.caption("Efface tout le suivi : appels et référents. Irréversible. Exporter avant.")
+            confirme = st.checkbox("Je comprends que tout sera effacé")
+            mot_confirm = st.text_input("Écris RESET pour confirmer", value="")
+            if st.button("🗑️ Tout réinitialiser",
+                         disabled=not (confirme and mot_confirm.strip().upper() == "RESET")):
+                reinitialiser_tout()
+                for cle in ("idx", "idx_adr"):
+                    st.session_state.pop(cle, None)
+                st.cache_data.clear()
+                st.success("Suivi réinitialisé.")
+                st.rerun()
+
+
+# Démo proposée à l'ouverture de session, ou rappelée depuis la barre latérale.
+if st.session_state.get("demo_active"):
+    afficher_demo(ROLE)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CONSTRUCTION DE LA FILE D'APPEL
+# FILE D'APPEL
 # ─────────────────────────────────────────────────────────────────────────────
 
 file_appel = base.copy()
-acces_direct = bool(code_direct.strip())
+acces_direct = bool(str(code_direct).strip())
 
 if acces_direct:
-    cible = code_direct.strip().upper()
+    cible = str(code_direct).strip().upper()
     direct = base[base[col_code].astype(str).str.upper() == cible]
     if direct.empty:
         st.sidebar.error(f"Aucun client avec le code « {code_direct} ».")
@@ -867,7 +1152,23 @@ if acces_direct:
         file_appel = direct.reset_index(drop=True)
         st.session_state.idx = 0
 
-if not acces_direct:
+if not acces_direct and ROLE == "commercial":
+    if f_traitement:
+        masques = []
+        if "Non traité" in f_traitement:
+            masques.append(file_appel["traite_par"].astype(str).str.strip() == "")
+        for nom in COMMERCIALES:
+            if f"Traité par {nom}" in f_traitement:
+                masques.append(file_appel["traite_par"] == nom)
+        if masques:
+            garde = masques[0]
+            for m in masques[1:]:
+                garde = garde | m
+            file_appel = file_appel[garde]
+    if f_masquer_ouvertes:
+        occupees = fiches_ouvertes_par_les_autres("client", UTILISATEUR)
+        if occupees:
+            file_appel = file_appel[~file_appel[col_code].astype(str).isin(occupees)]
     if f_type:
         file_appel = file_appel[file_appel["Type client"].isin(f_type)]
     if f_statut:
@@ -876,415 +1177,513 @@ if not acces_direct:
         file_appel = file_appel[file_appel["À compléter"].astype(str).str.strip() != ""]
     if recherche:
         r = recherche.lower()
-        masque = (
+        file_appel = file_appel[
             file_appel[col_code].astype(str).str.lower().str.contains(r, na=False)
             | file_appel["Raison sociale / Nom"].str.lower().str.contains(r, na=False)
             | file_appel["Ville"].str.lower().str.contains(r, na=False)
-        )
-        file_appel = file_appel[masque]
+        ]
     tri = ["priorite", "Raison sociale / Nom"] if tri_priorite else ["Raison sociale / Nom"]
     file_appel = file_appel.sort_values(tri).reset_index(drop=True)
 
 
-onglet_appel, onglet_adr, onglet_dash = st.tabs(
-    ["☎️  Appels clients", "📦  Points de livraison", "📊  Tableau de bord"]
-)
+# ─────────────────────────────────────────────────────────────────────────────
+# ONGLETS SELON LE RÔLE
+# ─────────────────────────────────────────────────────────────────────────────
+
+if ROLE == "commercial":
+    onglet_appel, onglet_adr, onglet_export = st.tabs(
+        ["☎️  Appels clients", "📦  Points de livraison", "⬇️  Export"]
+    )
+else:
+    (onglet_dash,) = st.tabs(["📊  Tableau de bord"])
 
 
-# ── ONGLET APPELS ────────────────────────────────────────────────────────────
-with onglet_appel:
-    if file_appel.empty:
-        st.success("Aucun client dans la file avec ces filtres. 🎉")
-        st.caption("Modifie les filtres dans la barre latérale, ou passe au tableau de bord pour exporter.")
-    else:
-        # Reprise de position : mémorisée en base, donc conservée après une
-        # déconnexion du navigateur.
-        if "idx" not in st.session_state:
-            derniere = lire_meta("derniere_fiche", "")
-            positions = file_appel.index[file_appel[col_code].astype(str) == derniere].tolist()
-            st.session_state.idx = positions[0] if positions else 0
-        st.session_state.idx = max(0, min(st.session_state.idx, len(file_appel) - 1))
-
-        nav1, nav2, nav3 = st.columns([1, 2, 1])
-        if nav1.button("⬅️ Précédent", use_container_width=True):
-            st.session_state.idx = max(0, st.session_state.idx - 1)
-            st.rerun()
-        if nav3.button("Suivant ➡️", use_container_width=True):
-            st.session_state.idx = min(len(file_appel) - 1, st.session_state.idx + 1)
-            st.rerun()
-        nav2.markdown(
-            f"<div style='text-align:center;font-weight:600;color:{VERT}'>"
-            f"Fiche {st.session_state.idx + 1} / {len(file_appel)}</div>",
-            unsafe_allow_html=True,
-        )
-
-        ligne = file_appel.iloc[st.session_state.idx]
-        code = str(ligne[col_code])
-        ecrire_meta("derniere_fiche", code)
-
-        gauche, droite = st.columns([3, 2])
-
-        with gauche:
-            st.markdown(f"### {ligne['Raison sociale / Nom']}")
-            st.markdown(
-                f"<span class='pill'>{ligne['Type client']}</span>"
-                f"<span class='pill pill-orange'>{ligne.get('Catégorie', '')}</span>"
-                f"<span style='color:#5a6b62'>Code {code}</span>",
-                unsafe_allow_html=True,
-            )
-            adresse = " ".join(
-                x for x in [ligne.get("Adresse 1", ""), ligne.get("Adresse 2", ""), ligne.get("Adresse 3", "")] if x
-            )
-            email_sec = ligne.get("Email secondaire", "")
-            st.markdown(
-                f"""<div class='fiche'>
-                📍 {adresse}<br>{ligne.get('Code postal', '')} {ligne.get('Ville', '')}<br><br>
-                ☎️ {ligne.get('Téléphone 1', '')} &nbsp; {ligne.get('Téléphone 2', '')} &nbsp; {ligne.get('Téléphone 3', '')}<br>
-                ✉️ {ligne.get('Email principal', '') or '<i>aucun e-mail</i>'}{(' · ' + email_sec) if email_sec else ''}<br>
-                🏢 SIREN : {ligne.get('SIREN', '') or '<i>—</i>'}
-                </div>""",
-                unsafe_allow_html=True,
-            )
-            if ligne.get("À compléter", ""):
-                st.warning(f"À compléter : {ligne['À compléter']}")
-
-            if not adresses.empty:
-                liees = adresses[adresses["Code client mère"] == code]
-                if not liees.empty:
-                    with st.expander(f"📦 {len(liees)} adresse(s) de livraison rattachée(s)"):
-                        st.dataframe(
-                            liees[["Code adresse", "Nom site", "Adresse 1", "Code postal", "Ville"]],
-                            hide_index=True, use_container_width=True,
-                        )
-
-        with droite:
-            st.markdown("#### Résultat de l'appel")
-            produits_init = [p for p in str(ligne.get("produits") or "").split("|") if p in PRODUITS]
-            rappel_init = None
-            if ligne.get("rappel_date"):
-                try:
-                    rappel_init = pd.to_datetime(ligne["rappel_date"]).date()
-                except Exception:
-                    rappel_init = None
-
-            # Chaque widget porte une clé incluant le code client : Streamlit crée
-            # un widget neuf par fiche, sinon l'état d'une fiche déborde sur la
-            # suivante et les saisies ne se remettent pas à zéro.
-            with st.form(f"appel_{code}", clear_on_submit=False):
-                statut = st.selectbox(
-                    "Statut", STATUTS,
-                    index=STATUTS.index(ligne["statut"]) if ligne["statut"] in STATUTS else 0,
-                    key=f"statut_{code}",
-                )
-                existe = st.radio(
-                    "Client toujours actif ?", ["Oui", "Non", "Incertain"], horizontal=True,
-                    index=["Oui", "Non", "Incertain"].index(ligne.get("existe"))
-                    if ligne.get("existe") in ("Oui", "Non", "Incertain") else 0,
-                    key=f"existe_{code}",
-                )
-                produits = st.multiselect("Produits achetés", PRODUITS, default=produits_init,
-                                          key=f"produits_{code}")
-                email_maj = st.text_input("E-mail confirmé / corrigé", value=ligne.get("email_maj") or "",
-                                          key=f"email_{code}")
-                tel_maj = st.text_input("Téléphone confirmé / corrigé", value=ligne.get("tel_maj") or "",
-                                        key=f"tel_{code}")
-                doublon_de = st.text_input(
-                    "Doublon du client n°", value=ligne.get("doublon_de") or "",
-                    help="Si ce client est un doublon, indiquer le code à conserver.",
-                    key=f"doublon_{code}",
-                )
-                motif_sortie = st.selectbox(
-                    "Motif de sortie (si ancien client)", MOTIFS_SORTIE,
-                    index=MOTIFS_SORTIE.index(ligne.get("motif_sortie"))
-                    if ligne.get("motif_sortie") in MOTIFS_SORTIE else 0,
-                    help="À renseigner si le statut est « Ancien client (à sortir) ».",
-                    key=f"motif_{code}",
-                )
-                rappel = st.date_input("Date de rappel (si applicable)", value=rappel_init,
-                                       key=f"rappel_{code}")
-                note = st.text_area("Notes (commercial, vérifications…)", value=ligne.get("note") or "",
-                                    height=90, key=f"note_{code}")
-                valide = st.form_submit_button("💾 Enregistrer & passer au suivant",
-                                               use_container_width=True, type="primary")
-
-            if valide:
-                erreurs = []
-                if email_maj.strip() and not re.match(r"^[^@\s]+@[^@\s]+\.[a-zA-Z]{2,}$", email_maj.strip()):
-                    erreurs.append("l'adresse e-mail ne semble pas valide")
-                if statut == "Doublon" and not doublon_de.strip():
-                    erreurs.append("indique le code du client à conserver")
-                if statut == "Ancien client (à sortir)" and motif_sortie == "—":
-                    erreurs.append("indique le motif de sortie")
-                if statut == "À rappeler" and not rappel:
-                    erreurs.append("indique une date de rappel")
-
-                if erreurs:
-                    st.error("Avant d'enregistrer : " + ", ".join(erreurs) + ".")
-                else:
-                    enregistrer(
-                        code,
-                        statut=statut,
-                        existe=existe,
-                        produits="|".join(produits),
-                        email_maj=email_maj.strip(),
-                        tel_maj=tel_maj.strip(),
-                        doublon_de=doublon_de.strip(),
-                        note=note.strip(),
-                        motif_sortie="" if motif_sortie == "—" else motif_sortie,
-                        rappel_date=rappel.isoformat() if rappel else "",
-                    )
-                    sauvegarde_auto()
-                    st.session_state.idx = min(len(file_appel) - 1, st.session_state.idx + 1)
-                    st.rerun()
-
-
-# ── ONGLET POINTS DE LIVRAISON ───────────────────────────────────────────────
-with onglet_adr:
-    if adresses.empty:
-        st.info("Le fichier ne contient pas de feuille « Adresses livraison ».")
-    else:
-        st.subheader("Vérification des points de livraison")
-        st.caption("Pour chaque adresse rattachée à une entreprise : qui est le référent sur place ?")
-
-        suivi_adr = charger_suivi_adresses()
-        adr = adresses.merge(suivi_adr, left_on="Code adresse", right_on="code_adresse", how="left")
-        for c in ["referent", "tel_site", "statut_adr", "note_adr"]:
-            adr[c] = adr[c].fillna("") if c in adr.columns else ""
-        adr["statut_adr"] = adr["statut_adr"].replace("", "À vérifier")
-
-        m1, m2, m3 = st.columns(3)
-        m1.metric("Points de livraison", len(adr))
-        m2.metric("Vérifiés", int((adr["statut_adr"] == "Vérifié ✅").sum()))
-        m3.metric("Restants", int((adr["statut_adr"] != "Vérifié ✅").sum()))
-
-        rech1, rech2 = st.columns(2)
-        q_adr = rech1.text_input("🔎 Code adresse exact (ex. 12771L56)")
-        q_mere = rech2.text_input("🔎 ou Code client mère (montre tous ses points)")
-
-        vue = adr.copy()
-        if q_adr.strip():
-            vue = vue[vue["Code adresse"].astype(str).str.upper() == q_adr.strip().upper()]
-        elif q_mere.strip():
-            vue = vue[vue["Code client mère"].astype(str).str.upper() == q_mere.strip().upper()]
+# ── ONGLET APPELS (commerciales) ─────────────────────────────────────────────
+if ROLE == "commercial":
+    with onglet_appel:
+        if file_appel.empty:
+            st.success("Aucun client dans la file avec ces filtres. 🎉")
+            st.caption("Modifie les filtres à gauche, ou passe à l'onglet Export.")
         else:
-            filtre_adr = st.multiselect("Statut", STATUTS_ADRESSE, default=["À vérifier"])
-            if filtre_adr:
-                vue = vue[vue["statut_adr"].isin(filtre_adr)]
-        vue = vue.reset_index(drop=True)
+            if "idx" not in st.session_state:
+                derniere = lire_meta(f"derniere_fiche_{UTILISATEUR}", "")
+                positions = file_appel.index[file_appel[col_code].astype(str) == derniere].tolist()
+                st.session_state.idx = positions[0] if positions else 0
+            st.session_state.idx = max(0, min(st.session_state.idx, len(file_appel) - 1))
 
-        if vue.empty:
-            st.success("Aucun point de livraison à afficher avec ce filtre.")
-        else:
-            if "idx_adr" not in st.session_state:
-                st.session_state.idx_adr = 0
-            st.session_state.idx_adr = max(0, min(st.session_state.idx_adr, len(vue) - 1))
-
-            n1, n2, n3 = st.columns([1, 2, 1])
-            if n1.button("⬅️ Précédent", key="adr_prev", use_container_width=True):
-                st.session_state.idx_adr = max(0, st.session_state.idx_adr - 1)
+            nav1, nav2, nav3 = st.columns([1, 2, 1])
+            if nav1.button("⬅️ Précédent", use_container_width=True):
+                st.session_state.idx = max(0, st.session_state.idx - 1)
                 st.rerun()
-            if n3.button("Suivant ➡️", key="adr_next", use_container_width=True):
-                st.session_state.idx_adr = min(len(vue) - 1, st.session_state.idx_adr + 1)
+            if nav3.button("Suivant ➡️", use_container_width=True):
+                st.session_state.idx = min(len(file_appel) - 1, st.session_state.idx + 1)
                 st.rerun()
-            n2.markdown(
+            nav2.markdown(
                 f"<div style='text-align:center;font-weight:600;color:{VERT}'>"
-                f"Point {st.session_state.idx_adr + 1} / {len(vue)}</div>",
+                f"Fiche {st.session_state.idx + 1} / {len(file_appel)}</div>",
                 unsafe_allow_html=True,
             )
 
-            point = vue.iloc[st.session_state.idx_adr]
-            code_adr = str(point["Code adresse"])
-            adresse_txt = " ".join(
-                x for x in [point.get("Adresse 1", ""), point.get("Adresse 2", ""), point.get("Adresse 3", "")] if x
-            )
+            ligne = file_appel.iloc[st.session_state.idx]
+            code = str(ligne[col_code])
+            poser_verrou("client", code, UTILISATEUR)
+            ecrire_meta(f"derniere_fiche_{UTILISATEUR}", code)
 
-            g, d = st.columns([3, 2])
-            with g:
-                st.markdown(f"### {point.get('Nom site', '') or 'Point de livraison'}")
+            # Bandeau si quelqu'un d'autre est sur la même fiche.
+            for qui, minutes in autres_sur_la_fiche("client", code, UTILISATEUR):
                 st.markdown(
-                    f"<span class='pill'>Adresse {code_adr}</span>"
-                    f"<span style='color:#5a6b62'>Client mère : {point.get('Code client mère', '')}</span>",
+                    f"<div class='bandeau-verrou'>⚠️ <b>{qui}</b> consulte cette fiche "
+                    f"{'à l’instant' if minutes < 1 else f'depuis {minutes} min'}. "
+                    f"Pour éviter d'appeler deux fois le même client, passez à la suivante.</div>",
                     unsafe_allow_html=True,
                 )
+
+            gauche, droite = st.columns([3, 2])
+
+            with gauche:
+                st.markdown(f"### {ligne['Raison sociale / Nom']}")
+                st.markdown(
+                    pastille_traitement(ligne.get("traite_par", ""))
+                    + f"<span class='pill'>{ligne['Type client']}</span>"
+                    + f"<span class='pill pill-orange'>{ligne.get('Catégorie', '')}</span>"
+                    + f"<span style='color:#5a6b62'>Code {code}</span>",
+                    unsafe_allow_html=True,
+                )
+                if ligne.get("maj_le"):
+                    st.caption(f"Dernière mise à jour : {jolie_date(ligne['maj_le'], True)}")
+
+                adresse = " ".join(x for x in [ligne.get("Adresse 1", ""), ligne.get("Adresse 2", ""),
+                                               ligne.get("Adresse 3", "")] if x)
+                email_sec = ligne.get("Email secondaire", "")
                 st.markdown(
                     f"""<div class='fiche'>
-                    📍 {adresse_txt}<br>{point.get('Code postal', '')} {point.get('Ville', '')}<br><br>
-                    ☎️ {point.get('Téléphone', '') or '<i>aucun téléphone</i>'}
+                    📍 {adresse}<br>{ligne.get('Code postal', '')} {ligne.get('Ville', '')}<br><br>
+                    ☎️ {ligne.get('Téléphone 1', '')} &nbsp; {ligne.get('Téléphone 2', '')} &nbsp; {ligne.get('Téléphone 3', '')}<br>
+                    ✉️ {ligne.get('Email principal', '') or '<i>aucun e-mail</i>'}{(' · ' + email_sec) if email_sec else ''}<br>
+                    🏢 SIREN : {ligne.get('SIREN', '') or '<i>—</i>'}
                     </div>""",
                     unsafe_allow_html=True,
                 )
-            with d:
-                st.markdown("#### Référent du site")
-                with st.form(f"adr_form_{code_adr}"):
-                    referent = st.text_input("Nom du référent sur place", value=point.get("referent") or "",
-                                             key=f"referent_{code_adr}")
-                    tel_site = st.text_input("Téléphone du site / référent", value=point.get("tel_site") or "",
-                                             key=f"tel_site_{code_adr}")
-                    statut_adr = st.selectbox(
-                        "Statut", STATUTS_ADRESSE,
-                        index=STATUTS_ADRESSE.index(point["statut_adr"])
-                        if point["statut_adr"] in STATUTS_ADRESSE else 0,
-                        key=f"statut_adr_{code_adr}",
-                    )
-                    note_adr = st.text_area("Note", value=point.get("note_adr") or "", height=80,
-                                            key=f"note_adr_{code_adr}")
-                    valide_adr = st.form_submit_button("💾 Enregistrer & suivant",
-                                                       use_container_width=True, type="primary")
-                if valide_adr:
-                    enregistrer_adresse(
-                        code_adr,
-                        referent=referent.strip(),
-                        tel_site=tel_site.strip(),
-                        statut_adr=statut_adr,
-                        note_adr=note_adr.strip(),
-                    )
-                    sauvegarde_auto()
+                if ligne.get("À compléter", ""):
+                    st.warning(f"À compléter : {ligne['À compléter']}")
+
+                if not adresses.empty:
+                    liees = adresses[adresses["Code client mère"] == code]
+                    if not liees.empty:
+                        with st.expander(f"📦 {len(liees)} adresse(s) de livraison rattachée(s)"):
+                            apercu = liees[["Code adresse", "Nom site", "Adresse 1", "Code postal", "Ville"]].merge(
+                                suivi_adr[["code_adresse", "statut_adr", "traite_par"]]
+                                if not suivi_adr.empty else
+                                pd.DataFrame(columns=["code_adresse", "statut_adr", "traite_par"]),
+                                left_on="Code adresse", right_on="code_adresse", how="left",
+                            ).fillna("")
+                            apercu["statut_adr"] = apercu["statut_adr"].replace("", "À vérifier")
+                            apercu["traite_par"] = apercu["traite_par"].replace("", "Non vérifié")
+                            st.dataframe(
+                                apercu[["Code adresse", "Nom site", "Ville", "statut_adr", "traite_par"]]
+                                .rename(columns={"statut_adr": "Statut", "traite_par": "Vérifié par"}),
+                                hide_index=True, use_container_width=True,
+                            )
+                            st.caption("Complétez ces points dans l'onglet « Points de livraison », "
+                                       "en recherchant par code client mère.")
+
+            with droite:
+                st.markdown("#### Résultat de l'appel")
+                produits_init = [p for p in str(ligne.get("produits") or "").split("|") if p in PRODUITS]
+                rappel_init = None
+                if ligne.get("rappel_date"):
+                    try:
+                        rappel_init = pd.to_datetime(ligne["rappel_date"]).date()
+                    except Exception:
+                        rappel_init = None
+
+                # Chaque widget porte une clé incluant le code client : sans cela,
+                # l'état d'une fiche déborderait sur la suivante.
+                with st.form(f"appel_{code}", clear_on_submit=False):
+                    statut = st.selectbox(
+                        "Statut", STATUTS,
+                        index=STATUTS.index(ligne["statut"]) if ligne["statut"] in STATUTS else 0,
+                        key=f"statut_{code}")
+                    existe = st.radio(
+                        "Client toujours actif ?", ["Oui", "Non", "Incertain"], horizontal=True,
+                        index=["Oui", "Non", "Incertain"].index(ligne.get("existe"))
+                        if ligne.get("existe") in ("Oui", "Non", "Incertain") else 0,
+                        key=f"existe_{code}")
+                    produits = st.multiselect("Produits achetés", PRODUITS, default=produits_init,
+                                              key=f"produits_{code}")
+                    email_maj = st.text_input("E-mail confirmé / corrigé",
+                                              value=ligne.get("email_maj") or "", key=f"email_{code}")
+                    tel_maj = st.text_input("Téléphone confirmé / corrigé",
+                                            value=ligne.get("tel_maj") or "", key=f"tel_{code}")
+                    doublon_de = st.text_input(
+                        "Doublon du client n°", value=ligne.get("doublon_de") or "",
+                        help="Si ce client est un doublon, indiquer le code à conserver.",
+                        key=f"doublon_{code}")
+                    motif_sortie = st.selectbox(
+                        "Motif de sortie (si ancien client)", MOTIFS_SORTIE,
+                        index=MOTIFS_SORTIE.index(ligne.get("motif_sortie"))
+                        if ligne.get("motif_sortie") in MOTIFS_SORTIE else 0,
+                        key=f"motif_{code}")
+                    rappel = st.date_input("Date de rappel (si applicable)", value=rappel_init,
+                                           key=f"rappel_{code}")
+                    note = st.text_area("Notes (commercial, vérifications…)",
+                                        value=ligne.get("note") or "", height=90, key=f"note_{code}")
+                    valide = st.form_submit_button("💾 Enregistrer & passer au suivant",
+                                                   use_container_width=True, type="primary")
+
+                if valide:
+                    erreurs = []
+                    if email_maj.strip() and not re.match(r"^[^@\s]+@[^@\s]+\.[a-zA-Z]{2,}$", email_maj.strip()):
+                        erreurs.append("l'adresse e-mail ne semble pas valide")
+                    if statut == "Doublon" and not doublon_de.strip():
+                        erreurs.append("indique le code du client à conserver")
+                    if statut == "Ancien client (à sortir)" and motif_sortie == "—":
+                        erreurs.append("indique le motif de sortie")
+                    if statut == "À rappeler" and not rappel:
+                        erreurs.append("indique une date de rappel")
+
+                    if erreurs:
+                        st.error("Avant d'enregistrer : " + ", ".join(erreurs) + ".")
+                    else:
+                        enregistrer(
+                            code, UTILISATEUR,
+                            statut=statut, existe=existe,
+                            produits="|".join(produits),
+                            email_maj=email_maj.strip(), tel_maj=tel_maj.strip(),
+                            doublon_de=doublon_de.strip(), note=note.strip(),
+                            motif_sortie="" if motif_sortie == "—" else motif_sortie,
+                            rappel_date=rappel.isoformat() if rappel else "",
+                        )
+                        sauvegarde_auto()
+                        st.session_state.idx = min(len(file_appel) - 1, st.session_state.idx + 1)
+                        st.rerun()
+
+
+    # ── ONGLET POINTS DE LIVRAISON ───────────────────────────────────────────
+    with onglet_adr:
+        if adresses.empty:
+            st.info("Le fichier ne contient pas de feuille « Adresses livraison ».")
+        else:
+            st.subheader("Vérification des points de livraison")
+            st.caption("Prolongement de l'appel : pour chaque site livré, qui est le référent sur place ?")
+
+            adr = adresses.merge(suivi_adr, left_on="Code adresse", right_on="code_adresse", how="left")
+            for c in ["referent", "tel_site", "statut_adr", "note_adr", "traite_par"]:
+                adr[c] = adr[c].fillna("") if c in adr.columns else ""
+            adr["statut_adr"] = adr["statut_adr"].replace("", "À vérifier")
+
+            m1, m2, m3 = st.columns(3)
+            m1.metric("Points de livraison", formater_entier(len(adr)))
+            m2.metric("Vérifiés", formater_entier(int((adr["statut_adr"] == "Vérifié ✅").sum())))
+            m3.metric("Restants", formater_entier(int((adr["statut_adr"] != "Vérifié ✅").sum())))
+
+            rech1, rech2 = st.columns(2)
+            q_adr = rech1.text_input("🔎 Code adresse exact (ex. 12771L56)")
+            q_mere = rech2.text_input("🔎 ou Code client mère (montre tous ses points)")
+
+            vue = adr.copy()
+            if q_adr.strip():
+                vue = vue[vue["Code adresse"].astype(str).str.upper() == q_adr.strip().upper()]
+            elif q_mere.strip():
+                vue = vue[vue["Code client mère"].astype(str).str.upper() == q_mere.strip().upper()]
+            else:
+                fa1, fa2 = st.columns(2)
+                filtre_adr = fa1.multiselect("Statut", STATUTS_ADRESSE, default=["À vérifier"])
+                filtre_qui = fa2.multiselect(
+                    "Traitement", ["Non vérifié"] + [f"Vérifié par {n}" for n in COMMERCIALES],
+                    default=[])
+                if filtre_adr:
+                    vue = vue[vue["statut_adr"].isin(filtre_adr)]
+                if filtre_qui:
+                    masques = []
+                    if "Non vérifié" in filtre_qui:
+                        masques.append(vue["traite_par"].astype(str).str.strip() == "")
+                    for nom in COMMERCIALES:
+                        if f"Vérifié par {nom}" in filtre_qui:
+                            masques.append(vue["traite_par"] == nom)
+                    if masques:
+                        garde = masques[0]
+                        for m in masques[1:]:
+                            garde = garde | m
+                        vue = vue[garde]
+            vue = vue.reset_index(drop=True)
+
+            if vue.empty:
+                st.success("Aucun point de livraison à afficher avec ce filtre.")
+            else:
+                if "idx_adr" not in st.session_state:
+                    st.session_state.idx_adr = 0
+                st.session_state.idx_adr = max(0, min(st.session_state.idx_adr, len(vue) - 1))
+
+                n1, n2, n3 = st.columns([1, 2, 1])
+                if n1.button("⬅️ Précédent", key="adr_prev", use_container_width=True):
+                    st.session_state.idx_adr = max(0, st.session_state.idx_adr - 1)
+                    st.rerun()
+                if n3.button("Suivant ➡️", key="adr_next", use_container_width=True):
                     st.session_state.idx_adr = min(len(vue) - 1, st.session_state.idx_adr + 1)
                     st.rerun()
-
-
-# ── ONGLET TABLEAU DE BORD ───────────────────────────────────────────────────
-with onglet_dash:
-    if modifs_en_attente > 0:
-        st.warning(
-            f"🔔 Sauvegarde : {modifs_en_attente} modification(s) à exporter. "
-            "Télécharge les CSV ci-dessous avant de fermer l'onglet."
-        )
-
-    st.subheader("🎯 Objectif pour tenir l'échéance")
-    st.caption(
-        f"Échéance : émission de la facturation électronique au {DEADLINE.strftime('%d/%m/%Y')} pour les PME."
-    )
-
-    perimetre = st.radio(
-        "Périmètre à boucler",
-        ["Tous les clients restants", "Uniquement les pros (conformité)"],
-        horizontal=True,
-    )
-    masque = (
-        base["Type client"].astype(str).str.startswith("Pro")
-        if perimetre.startswith("Uniquement")
-        else pd.Series(True, index=base.index)
-    )
-    restant_perimetre = int((masque & ~base["statut"].isin(STATUTS_TERMINES)).sum())
-    jo = jours_ouvres(dt.date.today(), DEADLINE)
-
-    o1, o2, o3, o4 = st.columns(4)
-    o1.metric("Restant sur ce périmètre", formater_entier(restant_perimetre))
-    o2.metric("Jours ouvrés d'ici l'échéance", str(jo))
-
-    if jo > 0:
-        objectif = -(-restant_perimetre // jo)
-        o3.metric("À traiter / jour", str(objectif))
-        if rythme:
-            o4.metric("Rythme actuel / jour", f"{rythme:.0f}", delta=f"{rythme - objectif:+.0f} vs objectif")
-            if rythme >= objectif:
-                st.success(
-                    f"✅ Au rythme actuel ({rythme:.0f}/jour), l'échéance est tenable sur ce périmètre."
+                n2.markdown(
+                    f"<div style='text-align:center;font-weight:600;color:{VERT}'>"
+                    f"Point {st.session_state.idx_adr + 1} / {len(vue)}</div>",
+                    unsafe_allow_html=True,
                 )
-            else:
-                fin_projetee = date_apres_jours_ouvres(dt.date.today(), round(restant_perimetre / rythme))
-                st.error(
-                    f"⚠️ Au rythme actuel ({rythme:.0f}/jour), fin estimée vers le "
-                    f"{fin_projetee.strftime('%d/%m/%Y')}, soit après l'échéance. "
-                    f"Il faut viser {objectif}/jour, ou renforcer l'équipe."
-                )
-        else:
-            o4.metric("Rythme actuel / jour", "—")
-            st.info("Le rythme s'affichera après les premiers appels enregistrés.")
-    else:
-        o3.metric("À traiter / jour", "—")
-        st.error("L'échéance est atteinte ou dépassée.")
 
-    st.divider()
-    st.subheader("Avancement de la campagne")
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Total clients", formater_entier(len(base)))
-    c2.metric("Traités", formater_entier(int(base["statut"].isin(STATUTS_TERMINES).sum())))
-    c3.metric("À rappeler", formater_entier(int((base["statut"] == "À rappeler").sum())))
-    c4.metric("Doublons repérés", formater_entier(int((base["statut"] == "Doublon").sum())))
+                point = vue.iloc[st.session_state.idx_adr]
+                code_adr = str(point["Code adresse"])
+                poser_verrou("adresse", code_adr, UTILISATEUR)
 
-    st.markdown("##### Répartition par statut")
-    st.bar_chart(base["statut"].value_counts())
+                for qui, minutes in autres_sur_la_fiche("adresse", code_adr, UTILISATEUR):
+                    st.markdown(
+                        f"<div class='bandeau-verrou'>⚠️ <b>{qui}</b> consulte ce point de livraison "
+                        f"{'à l’instant' if minutes < 1 else f'depuis {minutes} min'}.</div>",
+                        unsafe_allow_html=True,
+                    )
 
-    st.markdown("##### Répartition par type de client")
-    st.bar_chart(base["Type client"].value_counts())
+                adresse_txt = " ".join(x for x in [point.get("Adresse 1", ""), point.get("Adresse 2", ""),
+                                                   point.get("Adresse 3", "")] if x)
+                g, d = st.columns([3, 2])
+                with g:
+                    st.markdown(f"### {point.get('Nom site', '') or 'Point de livraison'}")
+                    st.markdown(
+                        pastille_traitement(point.get("traite_par", ""))
+                        + f"<span class='pill'>Adresse {code_adr}</span>"
+                        + f"<span style='color:#5a6b62'>Client mère : {point.get('Code client mère', '')}</span>",
+                        unsafe_allow_html=True,
+                    )
+                    st.markdown(
+                        f"""<div class='fiche'>
+                        📍 {adresse_txt}<br>{point.get('Code postal', '')} {point.get('Ville', '')}<br><br>
+                        ☎️ {point.get('Téléphone', '') or '<i>aucun téléphone</i>'}
+                        </div>""",
+                        unsafe_allow_html=True,
+                    )
+                with d:
+                    st.markdown("#### Référent du site")
+                    with st.form(f"adr_form_{code_adr}"):
+                        referent = st.text_input("Nom du référent sur place",
+                                                 value=point.get("referent") or "", key=f"referent_{code_adr}")
+                        tel_site = st.text_input("Téléphone du site / référent",
+                                                 value=point.get("tel_site") or "", key=f"tel_site_{code_adr}")
+                        statut_adr = st.selectbox(
+                            "Statut", STATUTS_ADRESSE,
+                            index=STATUTS_ADRESSE.index(point["statut_adr"])
+                            if point["statut_adr"] in STATUTS_ADRESSE else 0,
+                            key=f"statut_adr_{code_adr}")
+                        note_adr = st.text_area("Note", value=point.get("note_adr") or "",
+                                                height=80, key=f"note_adr_{code_adr}")
+                        valide_adr = st.form_submit_button("💾 Enregistrer & suivant",
+                                                           use_container_width=True, type="primary")
+                    if valide_adr:
+                        enregistrer_adresse(
+                            code_adr, UTILISATEUR,
+                            referent=referent.strip(), tel_site=tel_site.strip(),
+                            statut_adr=statut_adr, note_adr=note_adr.strip(),
+                        )
+                        sauvegarde_auto()
+                        st.session_state.idx_adr = min(len(vue) - 1, st.session_state.idx_adr + 1)
+                        st.rerun()
 
-    if not suivi.empty and suivi["produits"].str.len().gt(0).any():
-        eclate = suivi["produits"].str.split("|").explode()
-        eclate = eclate[eclate.isin(PRODUITS)]
-        if not eclate.empty:
-            st.markdown("##### Produits achetés (déclarés en appel)")
-            st.bar_chart(eclate.value_counts())
 
-    # Rappels du jour et en retard : la question qu'on se pose chaque matin.
-    rappels = base[(base["statut"] == "À rappeler") & (base["rappel_date"].astype(str).str.len() > 0)].copy()
-    if not rappels.empty:
-        rappels["date"] = pd.to_datetime(rappels["rappel_date"], errors="coerce").dt.date
-        aujourdhui = dt.date.today()
-        a_faire = rappels[rappels["date"].notna() & (rappels["date"] <= aujourdhui)]
-        if not a_faire.empty:
-            st.divider()
-            st.markdown(f"##### ⏰ {len(a_faire)} rappel(s) à passer aujourd'hui ou en retard")
-            st.dataframe(
-                a_faire[[col_code, "Raison sociale / Nom", "Ville", "Téléphone 1", "rappel_date", "note"]]
-                .rename(columns={col_code: "Code client", "rappel_date": "À rappeler le", "note": "Notes"}),
-                hide_index=True, use_container_width=True,
+    # ── ONGLET EXPORT ────────────────────────────────────────────────────────
+    with onglet_export:
+        st.subheader("Export du suivi")
+        if modifs_en_attente > 0:
+            st.warning(
+                f"🔔 {modifs_en_attente} modification(s) à exporter. "
+                "Télécharge les deux fichiers avant de fermer l'onglet."
             )
-
-    st.divider()
-    st.markdown("##### Export du suivi (sauvegarde et reporting)")
-    st.caption("Trace de la campagne, lisible dans Excel. La donnée de référence reste Logimatique.")
-
-    if suivi.empty:
-        st.info("Aucun appel enregistré pour le moment.")
-    else:
-        export = preparer_export(suivi, base, col_code)
-        exp1, exp2 = st.columns(2)
-        exp1.download_button(
-            "⬇️ Export CSV (Excel FR)",
-            export.to_csv(index=False, sep=";").encode("utf-8-sig"),
-            file_name=f"suivi_appels_hympyr_{dt.date.today():%Y%m%d}.csv",
-            mime="text/csv",
-            use_container_width=True,
-        )
-        exp2.download_button(
-            "⬇️ Export Excel (.xlsx)",
-            vers_excel(export, "Suivi appels"),
-            file_name=f"suivi_appels_hympyr_{dt.date.today():%Y%m%d}.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            use_container_width=True,
-        )
-        with st.expander("Aperçu de l'export clients"):
-            st.dataframe(export, hide_index=True, use_container_width=True)
-
-    if not adresses.empty:
-        st.divider()
-        st.markdown("##### Export des points de livraison (référents)")
-        export_adr = preparer_export_adresses(charger_suivi_adresses(), adresses)
-        if export_adr.empty:
-            st.info("Aucun point de livraison à exporter.")
         else:
-            ea1, ea2 = st.columns(2)
-            ea1.download_button(
-                "⬇️ Points de livraison — CSV (Excel FR)",
-                export_adr.to_csv(index=False, sep=";").encode("utf-8-sig"),
-                file_name=f"points_livraison_hympyr_{dt.date.today():%Y%m%d}.csv",
-                mime="text/csv",
-                use_container_width=True,
-            )
-            ea2.download_button(
-                "⬇️ Points de livraison — Excel (.xlsx)",
-                vers_excel(export_adr, "Points de livraison"),
-                file_name=f"points_livraison_hympyr_{dt.date.today():%Y%m%d}.xlsx",
+            st.success("✅ Tout est exporté : rien en attente.")
+        st.caption(
+            "Ces fichiers sont la sauvegarde de la campagne et servent à rouvrir une session "
+            "le lendemain. La donnée de référence reste Logimatique."
+        )
+
+        st.markdown("##### Suivi des appels clients")
+        if suivi.empty:
+            st.info("Aucun appel enregistré pour le moment.")
+        else:
+            export = preparer_export(suivi, base, col_code)
+            e1, e2 = st.columns(2)
+            e1.download_button(
+                "⬇️ Suivi clients — CSV (Excel FR)",
+                export.to_csv(index=False, sep=";").encode("utf-8-sig"),
+                file_name=f"suivi_appels_hympyr_{dt.date.today():%Y%m%d}.csv",
+                mime="text/csv", use_container_width=True)
+            e2.download_button(
+                "⬇️ Suivi clients — Excel (.xlsx)",
+                vers_excel(export, "Suivi appels"),
+                file_name=f"suivi_appels_hympyr_{dt.date.today():%Y%m%d}.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True,
-            )
-            with st.expander("Aperçu de l'export points de livraison"):
-                st.dataframe(export_adr, hide_index=True, use_container_width=True)
+                use_container_width=True)
+            with st.expander("Aperçu de l'export clients"):
+                st.dataframe(export, hide_index=True, use_container_width=True)
 
-    if modifs_en_attente > 0:
-        st.caption("Une fois tes fichiers téléchargés, confirme pour repasser au vert :")
-        if st.button("✅ J'ai bien téléchargé mes sauvegardes"):
-            ecrire_meta("dernier_export", maintenant_iso())
-            st.rerun()
+        if not adresses.empty:
+            st.divider()
+            st.markdown("##### Points de livraison et référents")
+            export_adr = preparer_export_adresses(suivi_adr, adresses)
+            if export_adr.empty:
+                st.info("Aucun point de livraison à exporter.")
+            else:
+                a1, a2 = st.columns(2)
+                a1.download_button(
+                    "⬇️ Points de livraison — CSV (Excel FR)",
+                    export_adr.to_csv(index=False, sep=";").encode("utf-8-sig"),
+                    file_name=f"points_livraison_hympyr_{dt.date.today():%Y%m%d}.csv",
+                    mime="text/csv", use_container_width=True)
+                a2.download_button(
+                    "⬇️ Points de livraison — Excel (.xlsx)",
+                    vers_excel(export_adr, "Points de livraison"),
+                    file_name=f"points_livraison_hympyr_{dt.date.today():%Y%m%d}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True)
+                with st.expander("Aperçu de l'export points de livraison"):
+                    st.dataframe(export_adr, hide_index=True, use_container_width=True)
+
+        if modifs_en_attente > 0:
+            st.divider()
+            st.caption("Une fois les deux fichiers téléchargés, confirme pour repasser au vert :")
+            if st.button("✅ J'ai bien téléchargé mes sauvegardes", type="primary"):
+                ecrire_meta("dernier_export", maintenant_iso())
+                st.rerun()
+
+
+# ── ONGLET TABLEAU DE BORD (manager) ─────────────────────────────────────────
+else:
+    with onglet_dash:
+        st.subheader("🎯 Objectif pour tenir l'échéance")
+        st.caption(f"Échéance : émission de la facturation électronique au "
+                   f"{DEADLINE.strftime('%d/%m/%Y')} pour les PME.")
+
+        perimetre = st.radio(
+            "Périmètre à boucler",
+            ["Tous les clients restants", "Uniquement les pros (conformité)"],
+            horizontal=True,
+        )
+        masque = (base["Type client"].astype(str).str.startswith("Pro")
+                  if perimetre.startswith("Uniquement") else pd.Series(True, index=base.index))
+        restant_perimetre = int((masque & ~base["statut"].isin(STATUTS_TERMINES)).sum())
+        jo = jours_ouvres(dt.date.today(), DEADLINE)
+
+        o1, o2, o3, o4 = st.columns(4)
+        o1.metric("Restant sur ce périmètre", formater_entier(restant_perimetre))
+        o2.metric("Jours ouvrés d'ici l'échéance", str(jo))
+
+        if jo > 0:
+            objectif = -(-restant_perimetre // jo)
+            o3.metric("À traiter / jour (équipe)", str(objectif))
+            if rythme_global:
+                o4.metric("Rythme équipe / jour", f"{rythme_global:.0f}",
+                          delta=f"{rythme_global - objectif:+.0f} vs objectif")
+                if rythme_global >= objectif:
+                    st.success(f"✅ Au rythme actuel ({rythme_global:.0f}/jour), "
+                               "l'échéance est tenable sur ce périmètre.")
+                else:
+                    fin = date_apres_jours_ouvres(dt.date.today(), round(restant_perimetre / rythme_global))
+                    st.error(f"⚠️ Au rythme actuel ({rythme_global:.0f}/jour), fin estimée vers le "
+                             f"{fin.strftime('%d/%m/%Y')}, soit après l'échéance. "
+                             f"Il faut viser {objectif}/jour, ou renforcer l'équipe.")
+            else:
+                o4.metric("Rythme équipe / jour", "—")
+                st.info("Le rythme s'affichera après les premiers appels enregistrés.")
+        else:
+            o3.metric("À traiter / jour", "—")
+            st.error("L'échéance est atteinte ou dépassée.")
+
+        # ── Performance par commerciale ──────────────────────────────────────
+        st.divider()
+        st.subheader("Performance des commerciales")
+        st.caption("Alimenté directement par la saisie de Chloé et de Patricia, sans ressaisie.")
+
+        colonnes = st.columns(len(COMMERCIALES))
+        for col, nom in zip(colonnes, COMMERCIALES):
+            s = stats[nom]
+            with col:
+                st.markdown(
+                    f"<span class='pill' style='background:{PROFILS[nom]['couleur']}'>{nom}</span>",
+                    unsafe_allow_html=True)
+                st.metric("Fiches traitées aujourd'hui", formater_entier(s["aujourdhui"]))
+                st.metric("Fiches traitées au total", formater_entier(s["terminees"]),
+                          help="Statuts Fait, Doublon ou Ancien client.")
+                st.metric("Rythme / jour actif", f"{s['rythme']:.0f}" if s["rythme"] else "—")
+                st.metric("Points de livraison vérifiés", formater_entier(s["points"]),
+                          delta=f"+{s['points_aujourdhui']} aujourd'hui" if s["points_aujourdhui"] else None)
+                st.metric("Rappels en cours", formater_entier(s["a_rappeler"]))
+
+        tableau = pd.DataFrame([
+            {
+                "Commerciale": nom,
+                "Fiches traitées": stats[nom]["fiches"],
+                "Dont terminées": stats[nom]["terminees"],
+                "Aujourd'hui": stats[nom]["aujourdhui"],
+                "Rappels en cours": stats[nom]["a_rappeler"],
+                "Points de livraison": stats[nom]["points"],
+                "Rythme / jour actif": round(stats[nom]["rythme"], 1) if stats[nom]["rythme"] else 0,
+            }
+            for nom in COMMERCIALES
+        ])
+        st.dataframe(tableau, hide_index=True, use_container_width=True)
+
+        non_traitees = int((base["traite_par"].astype(str).str.strip() == "").sum())
+        st.caption(f"{formater_entier(non_traitees)} fiche(s) ne sont encore attribuées à personne.")
+
+        # Activité quotidienne comparée
+        if not suivi.empty and (suivi["traite_par"] != "").any():
+            activite = suivi[suivi["traite_par"].isin(COMMERCIALES)].copy()
+            if not activite.empty:
+                activite["jour"] = pd.to_datetime(activite["maj_le"], errors="coerce").dt.date
+                pivot = (activite.dropna(subset=["jour"])
+                         .pivot_table(index="jour", columns="traite_par",
+                                      values="code_client", aggfunc="count")
+                         .fillna(0))
+                if not pivot.empty:
+                    st.markdown("##### Fiches traitées par jour")
+                    st.bar_chart(pivot)
+
+        # ── Avancement global ────────────────────────────────────────────────
+        st.divider()
+        st.subheader("Avancement de la campagne")
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Total clients", formater_entier(len(base)))
+        c2.metric("Traités", formater_entier(int(base["statut"].isin(STATUTS_TERMINES).sum())))
+        c3.metric("À rappeler", formater_entier(int((base["statut"] == "À rappeler").sum())))
+        c4.metric("Doublons repérés", formater_entier(int((base["statut"] == "Doublon").sum())))
+
+        g1, g2 = st.columns(2)
+        with g1:
+            st.markdown("##### Répartition par statut")
+            st.bar_chart(base["statut"].value_counts())
+        with g2:
+            st.markdown("##### Répartition par type de client")
+            st.bar_chart(base["Type client"].value_counts())
+
+        if not suivi.empty and suivi["produits"].str.len().gt(0).any():
+            eclate = suivi["produits"].str.split("|").explode()
+            eclate = eclate[eclate.isin(PRODUITS)]
+            if not eclate.empty:
+                st.markdown("##### Produits achetés (déclarés en appel)")
+                st.bar_chart(eclate.value_counts())
+
+        # ── Rappels du jour ou en retard ─────────────────────────────────────
+        rappels = base[(base["statut"] == "À rappeler")
+                       & (base["rappel_date"].astype(str).str.len() > 0)].copy()
+        if not rappels.empty:
+            rappels["date"] = pd.to_datetime(rappels["rappel_date"], errors="coerce").dt.date
+            a_faire = rappels[rappels["date"].notna() & (rappels["date"] <= dt.date.today())]
+            if not a_faire.empty:
+                st.divider()
+                st.markdown(f"##### ⏰ {len(a_faire)} rappel(s) à passer aujourd'hui ou en retard")
+                st.dataframe(
+                    a_faire[[col_code, "Raison sociale / Nom", "Ville", "Téléphone 1",
+                             "traite_par", "rappel_date", "note"]]
+                    .rename(columns={col_code: "Code client", "traite_par": "Traité par",
+                                     "rappel_date": "À rappeler le", "note": "Notes"}),
+                    hide_index=True, use_container_width=True,
+                )
+
+        st.divider()
+        st.caption(
+            "Profil manager : lecture seule. Les exports sont réalisés par les commerciales "
+            "depuis leur onglet « Export »."
+        )

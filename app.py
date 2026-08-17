@@ -304,6 +304,16 @@ def initialiser_base() -> None:
         """)
         con.execute("CREATE TABLE IF NOT EXISTS meta (cle TEXT PRIMARY KEY, valeur TEXT)")
         con.execute("""
+            CREATE TABLE IF NOT EXISTS journal (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                horodatage  TEXT,
+                auteur      TEXT,
+                action      TEXT,
+                cible       TEXT,
+                detail      TEXT
+            )
+        """)
+        con.execute("""
             CREATE TABLE IF NOT EXISTS verrous (
                 cle        TEXT PRIMARY KEY,
                 type_fiche TEXT,
@@ -398,10 +408,55 @@ def base_est_vide() -> bool:
     return n == 0
 
 
-def reinitialiser_tout() -> None:
+def reinitialiser_tout(auteur: str = "") -> None:
+    """Efface le suivi. Le journal est vidé lui aussi, mais garde une trace de
+    l'effacement : sans cela, le bouton annoncerait tout effacer et laisserait
+    un historique orphelin renvoyant à des fiches disparues."""
     with connexion() as con:
-        for t in ("suivi", "suivi_adresses", "meta", "verrous"):
+        for t in ("suivi", "suivi_adresses", "meta", "verrous", "journal"):
             con.execute(f"DELETE FROM {t}")
+    if auteur:
+        journaliser(auteur, "Réinitialisation complète", "—",
+                    "Suivi, référents et journal antérieur effacés.")
+
+
+def journaliser(auteur: str, action: str, cible: str, detail: str = "") -> None:
+    """Trace une intervention manuelle. Sert de preuve en cas de contestation."""
+    with connexion() as con:
+        con.execute(
+            "INSERT INTO journal (horodatage, auteur, action, cible, detail) VALUES (?,?,?,?,?)",
+            (maintenant_iso(), auteur, action, str(cible), detail),
+        )
+
+
+def charger_journal(limite: int = 200) -> pd.DataFrame:
+    with connexion() as con:
+        return pd.read_sql(
+            "SELECT horodatage, auteur, action, cible, detail FROM journal "
+            "ORDER BY id DESC LIMIT ?", con, params=(limite,), dtype=str
+        ).fillna("")
+
+
+def reattribuer(code: str, traitant: str, statut: str, auteur: str, ancien: dict) -> None:
+    """Réassigne manuellement une fiche : qui l'a traitée, et son statut.
+
+    Réservé au profil administrateur. Contrairement à enregistrer(), cette
+    fonction n'écrase pas traite_par avec le nom de la personne connectée :
+    c'est précisément son objet que de fixer une autre valeur. L'intervention
+    est inscrite au journal, avec l'état antérieur.
+    """
+    with connexion() as con:
+        con.execute(
+            "INSERT INTO suivi (code_client, statut, traite_par, maj_le) VALUES (?,?,?,?) "
+            "ON CONFLICT(code_client) DO UPDATE SET "
+            "statut=excluded.statut, traite_par=excluded.traite_par, maj_le=excluded.maj_le",
+            (str(code), statut, traitant, maintenant_iso()),
+        )
+    journaliser(
+        auteur, "Réattribution de fiche", code,
+        f"traité par « {ancien.get('traite_par') or 'personne'} » → « {traitant or 'personne'} » ; "
+        f"statut « {ancien.get('statut') or '—'} » → « {statut} »",
+    )
 
 
 # ── Verrous de consultation ──────────────────────────────────────────────────
@@ -779,6 +834,21 @@ def calculer_rythme(suivi_df: pd.DataFrame, utilisateur: str | None = None) -> f
     return len(termines) / jours_actifs if jours_actifs else None
 
 
+def rappels_dus(base_df: pd.DataFrame, utilisateur: str | None = None) -> pd.DataFrame:
+    """Clients à rappeler aujourd'hui ou dont la date de rappel est dépassée."""
+    if base_df.empty:
+        return base_df
+    df = base_df[(base_df["statut"] == "À rappeler")
+                 & (base_df["rappel_date"].astype(str).str.strip() != "")].copy()
+    if df.empty:
+        return df
+    df["date_rappel"] = pd.to_datetime(df["rappel_date"], errors="coerce").dt.date
+    df = df[df["date_rappel"].notna() & (df["date_rappel"] <= dt.date.today())]
+    if utilisateur:
+        df = df[df["traite_par"] == utilisateur]
+    return df.sort_values("date_rappel")
+
+
 def stats_utilisateur(suivi_df: pd.DataFrame, suivi_adr: pd.DataFrame, nom: str) -> dict:
     """Indicateurs d'activité d'une commerciale."""
     aujourdhui = dt.date.today()
@@ -865,10 +935,14 @@ DEMO_ADMIN = [
      "Elle cumule les deux vues : <b>vos propres chiffres</b> du jour, l'avancement global, "
      "et les <b>chiffres de Chloé et de Patricia</b>. En dessous, les filtres qui construisent "
      "votre file d'appel — dont « Traitement », qui évite les doublons."),
-    ("Onglets de travail : comme les commerciales",
+    ("Onglets de travail : comme les commerciales, avec un pouvoir en plus",
      "Sur une fiche, une <b>pastille colorée</b> indique qui l'a traitée. Vos propres "
      "enregistrements portent votre nom, en bleu. Un <b>bandeau orange</b> vous prévient si "
-     "quelqu'un consulte la même fiche en même temps que vous."),
+     "quelqu'un consulte la même fiche en même temps que vous.<br><br>"
+     "Sous le formulaire, un bloc <b>« Administration de la fiche »</b> n'apparaît que pour vous : "
+     "il permet de <b>réattribuer</b> une fiche à quelqu'un d'autre, de la <b>rendre à la file</b> "
+     "en la repassant à « non traité », ou de <b>forcer un statut</b>. "
+     "Chaque intervention est inscrite au journal, consultable depuis le tableau de bord."),
     ("Onglet « Tableau de bord » : la vue de pilotage",
      "Objectif quotidien face au rythme réel, performance comparée des deux commerciales, "
      "avancement global et rappels en retard. Vos propres fiches sont comptées dans l'avancement "
@@ -1058,13 +1132,24 @@ with st.sidebar:
         f"{LIBELLES_ROLES.get(ROLE, ROLE)}</span></div>",
         unsafe_allow_html=True,
     )
+    # Rafraîchissement : les données du suivi sont relues à chaque exécution,
+    # ce bouton force donc l'affichage des saisies faites par les autres depuis
+    # l'ouverture de la page.
+    if st.button("🔄 Actualiser les données", use_container_width=True, type="primary",
+                 help="Recharge le suivi pour voir en temps réel ce que les autres "
+                      "ont enregistré depuis votre dernière action."):
+        st.cache_data.clear()
+        st.rerun()
+    st.caption(f"Données à jour au {dt.datetime.now().strftime('%H:%M:%S')}")
+
     sc1, sc2 = st.columns(2)
     if sc1.button("🎓 Revoir la démo", use_container_width=True):
         st.session_state.demo_active = True
         st.session_state.demo_etape = 0
         st.rerun()
     if sc2.button("🚪 Déconnexion", use_container_width=True):
-        for cle in ("utilisateur", "role", "idx", "idx_adr", "demo_active", "demo_etape"):
+        for cle in ("utilisateur", "role", "idx", "idx_adr", "demo_active",
+                    "demo_etape", "saut_code"):
             st.session_state.pop(cle, None)
         st.rerun()
 
@@ -1075,8 +1160,11 @@ with st.sidebar:
         st.metric("Fiches traitées aujourd'hui", formater_entier(moi["aujourdhui"]))
         st.metric("Fiches traitées au total", formater_entier(moi["fiches"]))
         st.metric("Points de livraison vérifiés", formater_entier(moi["points"]))
-        if moi["a_rappeler"]:
-            st.info(f"⏰ {moi['a_rappeler']} rappel(s) à votre nom.")
+        nb_dus = len(rappels_dus(base, UTILISATEUR))
+        if nb_dus:
+            st.error(f"⏰ **{nb_dus} rappel(s) à passer aujourd'hui** — voir le bandeau en haut de page.")
+        elif moi["a_rappeler"]:
+            st.info(f"⏰ {moi['a_rappeler']} rappel(s) programmé(s) à votre nom, aucun dû aujourd'hui.")
         if modifs_en_attente > 0:
             st.error(f"⚠️ {modifs_en_attente} modification(s) non exportée(s) — onglet Export.")
         else:
@@ -1167,7 +1255,7 @@ with st.sidebar:
             mot_confirm = st.text_input("Écris RESET pour confirmer", value="")
             if st.button("🗑️ Tout réinitialiser",
                          disabled=not (confirme and mot_confirm.strip().upper() == "RESET")):
-                reinitialiser_tout()
+                reinitialiser_tout(UTILISATEUR)
                 for cle in ("idx", "idx_adr"):
                     st.session_state.pop(cle, None)
                 st.cache_data.clear()
@@ -1181,17 +1269,69 @@ if st.session_state.get("demo_active"):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# NOTIFICATION DES RAPPELS DUS
+# Affichée en haut de page, avant les onglets : c'est le seul endroit qu'on ne
+# peut pas manquer, quel que soit l'onglet ouvert.
+# ─────────────────────────────────────────────────────────────────────────────
+
+mes_rappels = rappels_dus(base, UTILISATEUR) if PEUT_TRAITER else pd.DataFrame()
+tous_rappels = rappels_dus(base)
+aujourdhui = dt.date.today()
+
+def _detail_rappels(df: pd.DataFrame, avec_bouton: bool) -> None:
+    """Liste des clients à rappeler, avec accès direct à leur fiche."""
+    for _, r in df.iterrows():
+        retard = (aujourdhui - r["date_rappel"]).days
+        quand = "aujourd'hui" if retard == 0 else f"en retard de {retard} jour(s)"
+        c1, c2 = st.columns([5, 1])
+        c1.markdown(
+            f"**{r['Raison sociale / Nom']}** — {r.get('Ville', '')} · "
+            f"☎️ {r.get('Téléphone 1', '') or '—'} · rappel {quand}"
+            + (f" · noté par {r['traite_par']}" if r.get("traite_par") else "")
+            + (f"<br><span style='color:#5a6b62;font-size:0.85rem'>{r['note']}</span>"
+               if r.get("note") else ""),
+            unsafe_allow_html=True,
+        )
+        if avec_bouton and c2.button("Ouvrir", key=f"saut_{r[col_code]}", use_container_width=True):
+            st.session_state.saut_code = str(r[col_code])
+            st.rerun()
+
+if PEUT_TRAITER and not mes_rappels.empty:
+    en_retard = int((mes_rappels["date_rappel"] < aujourdhui).sum())
+    complement = f", dont {en_retard} en retard" if en_retard else ""
+    st.error(f"### ⏰ {len(mes_rappels)} client(s) à rappeler aujourd'hui{complement}")
+    with st.expander("Voir la liste et ouvrir les fiches", expanded=True):
+        _detail_rappels(mes_rappels, avec_bouton=True)
+elif PEUT_PILOTER and not tous_rappels.empty:
+    en_retard = int((tous_rappels["date_rappel"] < aujourdhui).sum())
+    complement = f", dont {en_retard} en retard" if en_retard else ""
+    st.warning(f"### ⏰ {len(tous_rappels)} rappel(s) dû(s) dans l'équipe{complement}")
+    with st.expander("Voir la liste"):
+        _detail_rappels(tous_rappels, avec_bouton=False)
+
+# Les rappels des autres, pour information, quand on a déjà traité les siens.
+if PEUT_TRAITER and mes_rappels.empty and not tous_rappels.empty:
+    st.info(f"⏰ {len(tous_rappels)} rappel(s) dû(s) dans l'équipe, aucun à votre nom.")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # FILE D'APPEL
 # ─────────────────────────────────────────────────────────────────────────────
 
 file_appel = base.copy()
-acces_direct = bool(str(code_direct).strip())
+
+# Un saut depuis le bandeau de rappels court-circuite les filtres, comme
+# l'accès direct par code.
+code_saut = st.session_state.get("saut_code", "")
+code_cible = str(code_direct).strip() or code_saut
+acces_direct = bool(code_cible)
 
 if acces_direct:
-    cible = str(code_direct).strip().upper()
+    cible = str(code_cible).strip().upper()
     direct = base[base[col_code].astype(str).str.upper() == cible]
     if direct.empty:
-        st.sidebar.error(f"Aucun client avec le code « {code_direct} ».")
+        st.sidebar.error(f"Aucun client avec le code « {code_cible} ».")
+        st.session_state.pop("saut_code", None)
         acces_direct = False
     else:
         file_appel = direct.reset_index(drop=True)
@@ -1256,6 +1396,12 @@ if PEUT_PILOTER:
 # ── ONGLETS DE TRAVAIL (commerciales et administrateur) ──────────────────────
 if PEUT_TRAITER:
     with onglet_appel:
+        if st.session_state.get("saut_code"):
+            if st.button("↩︎ Revenir à ma file d'appel"):
+                st.session_state.pop("saut_code", None)
+                st.session_state.pop("idx", None)
+                st.rerun()
+
         if file_appel.empty:
             st.success("Aucun client dans la file avec ces filtres. 🎉")
             st.caption("Modifie les filtres à gauche, ou passe à l'onglet Export.")
@@ -1412,6 +1558,49 @@ if PEUT_TRAITER:
                         sauvegarde_auto()
                         st.session_state.idx = min(len(file_appel) - 1, st.session_state.idx + 1)
                         st.rerun()
+
+                # ── Réattribution manuelle, réservée à l'administrateur ──────
+                # Permet de corriger une attribution : rendre une fiche à la
+                # file (« Non traité »), la basculer d'une personne à l'autre,
+                # ou forcer un statut sans repasser par le formulaire d'appel.
+                if ROLE == "admin":
+                    st.divider()
+                    with st.expander("🛠️ Administration de la fiche", expanded=False):
+                        st.caption(
+                            "Réservé à l'administrateur. Modifie l'attribution et le statut "
+                            "sans toucher aux autres informations de la fiche. "
+                            "Chaque intervention est inscrite au journal."
+                        )
+                        actuel = str(ligne.get("traite_par") or "")
+                        options_qui = ["Non traité"] + TRAITANTS
+                        with st.form(f"admin_fiche_{code}"):
+                            nouveau_qui = st.selectbox(
+                                "Attribuer la fiche à", options_qui,
+                                index=options_qui.index(actuel) if actuel in options_qui else 0,
+                                key=f"admin_qui_{code}",
+                            )
+                            nouveau_statut = st.selectbox(
+                                "Forcer le statut", STATUTS,
+                                index=STATUTS.index(ligne["statut"]) if ligne["statut"] in STATUTS else 0,
+                                key=f"admin_statut_{code}",
+                            )
+                            appliquer = st.form_submit_button(
+                                "Appliquer la modification", use_container_width=True)
+                        if appliquer:
+                            traitant = "" if nouveau_qui == "Non traité" else nouveau_qui
+                            if traitant == actuel and nouveau_statut == ligne["statut"]:
+                                st.info("Aucun changement à appliquer.")
+                            else:
+                                reattribuer(
+                                    code, traitant, nouveau_statut, UTILISATEUR,
+                                    {"traite_par": actuel, "statut": ligne["statut"]},
+                                )
+                                sauvegarde_auto()
+                                st.success(
+                                    f"Fiche {code} : attribuée à "
+                                    f"{traitant or 'personne'}, statut « {nouveau_statut} »."
+                                )
+                                st.rerun()
 
 
     # ── ONGLET POINTS DE LIVRAISON ───────────────────────────────────────────
@@ -1746,6 +1935,21 @@ if PEUT_PILOTER:
                              "traite_par", "rappel_date", "note"]]
                     .rename(columns={col_code: "Code client", "traite_par": "Traité par",
                                      "rappel_date": "À rappeler le", "note": "Notes"}),
+                    hide_index=True, use_container_width=True,
+                )
+
+        # ── Journal des interventions manuelles ─────────────────────────────
+        journal = charger_journal()
+        if not journal.empty:
+            st.divider()
+            with st.expander(f"🛠️ Journal des interventions manuelles ({len(journal)})"):
+                st.caption("Réattributions et forçages de statut effectués par un administrateur.")
+                affichage = journal.copy()
+                affichage["horodatage"] = affichage["horodatage"].map(lambda v: jolie_date(v, True))
+                st.dataframe(
+                    affichage.rename(columns={
+                        "horodatage": "Quand", "auteur": "Par qui",
+                        "action": "Action", "cible": "Fiche", "detail": "Détail"}),
                     hide_index=True, use_container_width=True,
                 )
 

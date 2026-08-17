@@ -118,6 +118,16 @@ STATUTS = [
 STATUTS_TERMINES = {"Fait ✅", "Doublon", "Ancien client (à sortir)"}
 STATUTS_ADRESSE = ["À vérifier", "Vérifié ✅", "Adresse obsolète"]
 
+# Champs que l'on peut demander à vider explicitement, et leur libellé.
+LIBELLES_CHAMPS = {
+    "Produits achetés": "produits",
+    "E-mail confirmé": "email_maj",
+    "Téléphone confirmé": "tel_maj",
+    "Doublon du client n°": "doublon_de",
+    "Motif de sortie": "motif_sortie",
+    "Notes": "note",
+}
+
 MOTIFS_SORTIE = [
     "—", "Passé à la concurrence", "Utilise une autre énergie",
     "Décès", "Cessation d'activité / fermeture", "Ne souhaite plus être contacté",
@@ -364,9 +374,60 @@ def charger_suivi_adresses() -> pd.DataFrame:
         return pd.read_sql("SELECT * FROM suivi_adresses", con, dtype=str).fillna("")
 
 
-def enregistrer(code: str, utilisateur: str, **champs) -> None:
+# Champs pour lesquels une valeur vide transmise à l'enregistrement est presque
+# toujours accidentelle : une date qui n'a pas pu être relue, un champ non
+# réaffiché, un formulaire partiellement rempli. Ils ne sont jamais écrasés par
+# du vide, sauf demande explicite d'effacement.
+CHAMPS_PROTEGES = ("existe", "produits", "email_maj", "tel_maj", "note",
+                   "doublon_de", "rappel_date", "motif_sortie")
+CHAMPS_PROTEGES_ADR = ("referent", "tel_site", "note_adr")
+
+
+def lire_fiche(code: str) -> dict:
+    """État actuel d'une fiche en base, ou dictionnaire vide si elle n'existe pas."""
+    with connexion() as con:
+        colonnes = [r[1] for r in con.execute("PRAGMA table_info(suivi)").fetchall()]
+        ligne = con.execute("SELECT * FROM suivi WHERE code_client=?", (str(code),)).fetchone()
+    return {c: (v if v is not None else "") for c, v in zip(colonnes, ligne)} if ligne else {}
+
+
+def lire_fiche_adresse(code: str) -> dict:
+    with connexion() as con:
+        colonnes = [r[1] for r in con.execute("PRAGMA table_info(suivi_adresses)").fetchall()]
+        ligne = con.execute("SELECT * FROM suivi_adresses WHERE code_adresse=?",
+                            (str(code),)).fetchone()
+    return {c: (v if v is not None else "") for c, v in zip(colonnes, ligne)} if ligne else {}
+
+
+def _fusionner(existant: dict, champs: dict, proteges: tuple, effacements: Iterable[str]) -> dict:
+    """Empêche qu'une valeur déjà saisie soit remplacée par du vide.
+
+    Une donnée inscrite dans une fiche ne disparaît que si son effacement est
+    demandé explicitement. C'est ce qui garantit qu'une date de rappel, une note
+    ou un e-mail corrigé survivent à tous les enregistrements suivants.
+    """
+    effacements = set(effacements or ())
+    fusion = {}
+    for cle, valeur in champs.items():
+        texte = "" if valeur is None else str(valeur)
+        if (not texte.strip()) and cle in proteges and cle not in effacements and existant.get(cle):
+            fusion[cle] = existant[cle]      # on conserve ce qui était déjà saisi
+        else:
+            fusion[cle] = texte
+    return fusion
+
+
+def enregistrer(code: str, utilisateur: str, effacements: Iterable[str] = (), **champs) -> None:
+    """Enregistre une fiche sans jamais perdre une information déjà saisie.
+
+    Les champs listés dans `effacements` sont les seuls que l'on accepte de
+    vider. Passer effacements=CHAMPS_PROTEGES rend l'écriture intégrale, ce que
+    fait la restauration d'une sauvegarde : elle doit faire foi.
+    """
+    champs = _fusionner(lire_fiche(code), champs, CHAMPS_PROTEGES, effacements)
     champs["code_client"] = str(code)
-    champs["traite_par"] = utilisateur
+    if utilisateur or "traite_par" in effacements:
+        champs["traite_par"] = utilisateur
     champs["maj_le"] = maintenant_iso()
     cols = ",".join(champs)
     ph = ",".join("?" for _ in champs)
@@ -379,9 +440,14 @@ def enregistrer(code: str, utilisateur: str, **champs) -> None:
         )
 
 
-def enregistrer_adresse(code_adresse: str, utilisateur: str, **champs) -> None:
+def enregistrer_adresse(code_adresse: str, utilisateur: str,
+                        effacements: Iterable[str] = (), **champs) -> None:
+    """Même protection que pour les fiches clients."""
+    champs = _fusionner(lire_fiche_adresse(code_adresse), champs,
+                        CHAMPS_PROTEGES_ADR, effacements)
     champs["code_adresse"] = str(code_adresse)
-    champs["traite_par"] = utilisateur
+    if utilisateur or "traite_par" in effacements:
+        champs["traite_par"] = utilisateur
     champs["maj_le"] = maintenant_iso()
     cols = ",".join(champs)
     ph = ",".join("?" for _ in champs)
@@ -567,6 +633,9 @@ def importer_suivi_clients_csv(fichier) -> int:
         enregistrer(
             code,
             utilisateur=val(ligne, "traite_par"),   # on conserve l'auteur d'origine
+            # La restauration fait foi : elle réécrit la fiche telle qu'exportée,
+            # y compris les champs vides.
+            effacements=CHAMPS_PROTEGES + ("traite_par",),
             statut=val(ligne, "statut") or "À appeler",
             existe=val(ligne, "existe"),
             produits=produits,
@@ -613,6 +682,7 @@ def importer_suivi_adresses_csv(fichier) -> int:
         enregistrer_adresse(
             code,
             utilisateur=val(ligne, "traite_par"),
+            effacements=CHAMPS_PROTEGES_ADR + ("traite_par",),
             referent=val(ligne, "referent"),
             tel_site=val(ligne, "tel_site"),
             statut_adr=val(ligne, "statut_adr") or "À vérifier",
@@ -1525,10 +1595,27 @@ if PEUT_TRAITER:
                         index=MOTIFS_SORTIE.index(ligne.get("motif_sortie"))
                         if ligne.get("motif_sortie") in MOTIFS_SORTIE else 0,
                         key=f"motif_{code}")
-                    rappel = st.date_input("Date de rappel (si applicable)", value=rappel_init,
-                                           key=f"rappel_{code}")
+                    # La date de rappel est pilotée par une case à cocher : tant
+                    # qu'elle est cochée, la date existante est conservée même si
+                    # le champ n'a pas été touché. La décocher est le seul moyen
+                    # de supprimer un rappel, et c'est un geste délibéré.
+                    veut_rappel = st.checkbox(
+                        "Programmer un rappel", value=bool(rappel_init),
+                        key=f"veut_rappel_{code}",
+                        help="Décocher supprime la date de rappel enregistrée.")
+                    rappel = st.date_input(
+                        "Date de rappel", value=rappel_init or dt.date.today(),
+                        key=f"rappel_{code}", disabled=not veut_rappel)
                     note = st.text_area("Notes (commercial, vérifications…)",
                                         value=ligne.get("note") or "", height=90, key=f"note_{code}")
+                    with st.expander("Effacer volontairement un champ"):
+                        st.caption(
+                            "Par défaut, un champ laissé vide ne remplace jamais une information "
+                            "déjà enregistrée. Cochez ici ce que vous voulez réellement supprimer."
+                        )
+                        a_effacer = st.multiselect(
+                            "Champs à vider", list(LIBELLES_CHAMPS), default=[],
+                            key=f"effacer_{code}", label_visibility="collapsed")
                     valide = st.form_submit_button("💾 Enregistrer & passer au suivant",
                                                    use_container_width=True, type="primary")
 
@@ -1540,20 +1627,24 @@ if PEUT_TRAITER:
                         erreurs.append("indique le code du client à conserver")
                     if statut == "Ancien client (à sortir)" and motif_sortie == "—":
                         erreurs.append("indique le motif de sortie")
-                    if statut == "À rappeler" and not rappel:
-                        erreurs.append("indique une date de rappel")
+                    if statut == "À rappeler" and not veut_rappel:
+                        erreurs.append("coche « Programmer un rappel » et indique une date")
 
                     if erreurs:
                         st.error("Avant d'enregistrer : " + ", ".join(erreurs) + ".")
                     else:
+                        # Seuls les champs explicitement désignés peuvent être vidés.
+                        effacements = [LIBELLES_CHAMPS[lib] for lib in a_effacer]
+                        if not veut_rappel:
+                            effacements.append("rappel_date")
                         enregistrer(
-                            code, UTILISATEUR,
+                            code, UTILISATEUR, effacements=effacements,
                             statut=statut, existe=existe,
                             produits="|".join(produits),
                             email_maj=email_maj.strip(), tel_maj=tel_maj.strip(),
                             doublon_de=doublon_de.strip(), note=note.strip(),
                             motif_sortie="" if motif_sortie == "—" else motif_sortie,
-                            rappel_date=rappel.isoformat() if rappel else "",
+                            rappel_date=rappel.isoformat() if (veut_rappel and rappel) else "",
                         )
                         sauvegarde_auto()
                         st.session_state.idx = min(len(file_appel) - 1, st.session_state.idx + 1)
@@ -1715,11 +1806,22 @@ if PEUT_TRAITER:
                             key=f"statut_adr_{code_adr}")
                         note_adr = st.text_area("Note", value=point.get("note_adr") or "",
                                                 height=80, key=f"note_adr_{code_adr}")
+                        with st.expander("Effacer volontairement un champ"):
+                            st.caption("Un champ laissé vide ne remplace jamais une information "
+                                       "déjà enregistrée.")
+                            a_effacer_adr = st.multiselect(
+                                "Champs à vider",
+                                ["Référent sur place", "Téléphone du site", "Note"],
+                                default=[], key=f"effacer_adr_{code_adr}",
+                                label_visibility="collapsed")
                         valide_adr = st.form_submit_button("💾 Enregistrer & suivant",
                                                            use_container_width=True, type="primary")
                     if valide_adr:
+                        corresp_adr = {"Référent sur place": "referent",
+                                       "Téléphone du site": "tel_site", "Note": "note_adr"}
                         enregistrer_adresse(
                             code_adr, UTILISATEUR,
+                            effacements=[corresp_adr[x] for x in a_effacer_adr],
                             referent=referent.strip(), tel_site=tel_site.strip(),
                             statut_adr=statut_adr, note_adr=note_adr.strip(),
                         )

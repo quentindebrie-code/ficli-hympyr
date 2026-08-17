@@ -1595,17 +1595,25 @@ if PEUT_TRAITER:
                         index=MOTIFS_SORTIE.index(ligne.get("motif_sortie"))
                         if ligne.get("motif_sortie") in MOTIFS_SORTIE else 0,
                         key=f"motif_{code}")
-                    # La date de rappel est pilotée par une case à cocher : tant
-                    # qu'elle est cochée, la date existante est conservée même si
-                    # le champ n'a pas été touché. La décocher est le seul moyen
-                    # de supprimer un rappel, et c'est un geste délibéré.
-                    veut_rappel = st.checkbox(
-                        "Programmer un rappel", value=bool(rappel_init),
-                        key=f"veut_rappel_{code}",
-                        help="Décocher supprime la date de rappel enregistrée.")
+                    # Champ de date toujours actif : à l'intérieur d'un formulaire,
+                    # une case à cocher ne prend effet qu'à l'enregistrement, elle ne
+                    # peut donc pas conditionner l'accès à un autre champ.
+                    # La plage est volontairement large pour n'imposer aucune limite.
                     rappel = st.date_input(
-                        "Date de rappel", value=rappel_init or dt.date.today(),
-                        key=f"rappel_{code}", disabled=not veut_rappel)
+                        "Date de rappel (laisser vide s'il n'y en a pas)",
+                        value=rappel_init,
+                        min_value=dt.date(2020, 1, 1),
+                        max_value=dt.date.today() + dt.timedelta(days=365 * 5),
+                        format="DD/MM/YYYY",
+                        key=f"rappel_{code}",
+                        help="Saisissez la date au clavier (JJ/MM/AAAA) ou choisissez-la "
+                             "dans le calendrier.")
+                    # La suppression d'un rappel existant reste un geste explicite.
+                    supprimer_rappel = False
+                    if rappel_init:
+                        supprimer_rappel = st.checkbox(
+                            f"Supprimer le rappel du {rappel_init.strftime('%d/%m/%Y')}",
+                            value=False, key=f"suppr_rappel_{code}")
                     note = st.text_area("Notes (commercial, vérifications…)",
                                         value=ligne.get("note") or "", height=90, key=f"note_{code}")
                     with st.expander("Effacer volontairement un champ"):
@@ -1627,15 +1635,15 @@ if PEUT_TRAITER:
                         erreurs.append("indique le code du client à conserver")
                     if statut == "Ancien client (à sortir)" and motif_sortie == "—":
                         erreurs.append("indique le motif de sortie")
-                    if statut == "À rappeler" and not veut_rappel:
-                        erreurs.append("coche « Programmer un rappel » et indique une date")
+                    if statut == "À rappeler" and (not rappel or supprimer_rappel):
+                        erreurs.append("indique une date de rappel")
 
                     if erreurs:
                         st.error("Avant d'enregistrer : " + ", ".join(erreurs) + ".")
                     else:
                         # Seuls les champs explicitement désignés peuvent être vidés.
                         effacements = [LIBELLES_CHAMPS[lib] for lib in a_effacer]
-                        if not veut_rappel:
+                        if supprimer_rappel:
                             effacements.append("rappel_date")
                         enregistrer(
                             code, UTILISATEUR, effacements=effacements,
@@ -1644,7 +1652,7 @@ if PEUT_TRAITER:
                             email_maj=email_maj.strip(), tel_maj=tel_maj.strip(),
                             doublon_de=doublon_de.strip(), note=note.strip(),
                             motif_sortie="" if motif_sortie == "—" else motif_sortie,
-                            rappel_date=rappel.isoformat() if (veut_rappel and rappel) else "",
+                            rappel_date="" if supprimer_rappel else (rappel.isoformat() if rappel else ""),
                         )
                         sauvegarde_auto()
                         st.session_state.idx = min(len(file_appel) - 1, st.session_state.idx + 1)

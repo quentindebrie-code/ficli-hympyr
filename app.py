@@ -64,6 +64,7 @@ DOSSIER_SAUVEGARDES = DOSSIER_DONNEES / "sauvegardes"
 DOSSIER_SAUVEGARDES.mkdir(parents=True, exist_ok=True)
 
 VERT, VERT_FONCE, ORANGE, GRIS = "#1A6B45", "#0D3D27", "#FF5C29", "#8E9A94"
+BLEU = "#2F5D8C"   # profil administrateur
 
 # ── Comptes ──────────────────────────────────────────────────────────────────
 # Les mots de passe ne figurent jamais en clair : seule leur empreinte SHA-256
@@ -88,9 +89,22 @@ PROFILS = {
         "couleur": VERT_FONCE,
         "empreinte": "e97cafd6d1baa1ede105c0811b8e26d144505b1cb49d9107f720e6d424202a47",
     },
+    "Quentin": {
+        "role": "admin",
+        "couleur": BLEU,
+        # Mot de passe provisoire : QDEadmin8131@!!  — à changer, voir empreinte().
+        "empreinte": "c6d1892f279428bcd9e60975e74de88fef32ba28c6d080d5475640d60e5c10cc",
+    },
 }
 
+LIBELLES_ROLES = {"commercial": "Commerciale", "manager": "Manager", "admin": "Administrateur"}
+
+# Qui apparaît dans le suivi de performance du tableau de bord.
 COMMERCIALES = [nom for nom, p in PROFILS.items() if p["role"] == "commercial"]
+# Qui peut traiter une fiche, donc apparaître dans les filtres et les pastilles.
+TRAITANTS = [nom for nom, p in PROFILS.items() if p["role"] in ("commercial", "admin")]
+# Le RESET reste exclusif au manager.
+ROLES_RESET = {"manager"}
 
 PRODUITS = [
     "GNR", "Gasoil routier", "Sans plomb", "AdBlue",
@@ -841,9 +855,34 @@ DEMO_MANAGER = [
 ]
 
 
+DEMO_ADMIN = [
+    ("Votre profil : accès complet",
+     "Vous disposez des <b>quatre onglets</b> : les trois onglets de travail des commerciales "
+     "(appels, points de livraison, export) et le <b>tableau de bord</b> du manager. "
+     "Seule la <b>réinitialisation</b> vous est fermée : elle reste exclusive au profil manager, "
+     "pour qu'un effacement total ne puisse jamais partir d'un poste qui saisit."),
+    ("La colonne de gauche : vos chiffres et ceux de l'équipe",
+     "Elle cumule les deux vues : <b>vos propres chiffres</b> du jour, l'avancement global, "
+     "et les <b>chiffres de Chloé et de Patricia</b>. En dessous, les filtres qui construisent "
+     "votre file d'appel — dont « Traitement », qui évite les doublons."),
+    ("Onglets de travail : comme les commerciales",
+     "Sur une fiche, une <b>pastille colorée</b> indique qui l'a traitée. Vos propres "
+     "enregistrements portent votre nom, en bleu. Un <b>bandeau orange</b> vous prévient si "
+     "quelqu'un consulte la même fiche en même temps que vous."),
+    ("Onglet « Tableau de bord » : la vue de pilotage",
+     "Objectif quotidien face au rythme réel, performance comparée des deux commerciales, "
+     "avancement global et rappels en retard. Vos propres fiches sont comptées dans l'avancement "
+     "global, et signalées à part dans le bloc de performance : le suivi des commerciales reste lisible."),
+    ("Ce qu'il faut faire chaque soir",
+     "Comme les commerciales, pensez à l'onglet <b>Export</b> : un compteur indique les "
+     "modifications non sauvegardées. Les deux fichiers téléchargés servent à rouvrir "
+     "une session le lendemain."),
+]
+
+
 def afficher_demo(role: str) -> None:
     """Visite guidée en pop-up, proposée à l'ouverture de session."""
-    etapes = DEMO_COMMERCIAL if role == "commercial" else DEMO_MANAGER
+    etapes = {"commercial": DEMO_COMMERCIAL, "manager": DEMO_MANAGER, "admin": DEMO_ADMIN}[role]
     idx = st.session_state.get("demo_etape", 0)
     idx = max(0, min(idx, len(etapes) - 1))
     titre, texte = etapes[idx]
@@ -975,6 +1014,11 @@ UTILISATEUR = st.session_state.utilisateur
 ROLE = st.session_state.role
 COULEUR_MOI = PROFILS[UTILISATEUR]["couleur"]
 
+# Droits dérivés du rôle, plutôt que des tests dispersés sur le nom du rôle.
+PEUT_TRAITER = ROLE in ("commercial", "admin")   # onglets appels, points, export
+PEUT_PILOTER = ROLE in ("manager", "admin")      # onglet tableau de bord
+PEUT_REINITIALISER = ROLE in ROLES_RESET         # exclusif au manager
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CHARGEMENT DES DONNÉES
@@ -1011,7 +1055,7 @@ with st.sidebar:
         f"<div style='background:{COULEUR_MOI};color:#fff;border-radius:10px;"
         f"padding:12px 16px;font-weight:700;margin-bottom:12px'>"
         f"{UTILISATEUR}<br><span style='font-weight:400;font-size:0.82rem'>"
-        f"{'Commerciale' if ROLE == 'commercial' else 'Manager'}</span></div>",
+        f"{LIBELLES_ROLES.get(ROLE, ROLE)}</span></div>",
         unsafe_allow_html=True,
     )
     sc1, sc2 = st.columns(2)
@@ -1024,10 +1068,10 @@ with st.sidebar:
             st.session_state.pop(cle, None)
         st.rerun()
 
-    if ROLE == "commercial":
+    if PEUT_TRAITER:
         st.divider()
         st.header("Mes chiffres")
-        moi = stats[UTILISATEUR]
+        moi = stats_utilisateur(suivi, suivi_adr, UTILISATEUR)
         st.metric("Fiches traitées aujourd'hui", formater_entier(moi["aujourdhui"]))
         st.metric("Fiches traitées au total", formater_entier(moi["fiches"]))
         st.metric("Points de livraison vérifiés", formater_entier(moi["points"]))
@@ -1047,7 +1091,7 @@ with st.sidebar:
     st.metric("Traités", formater_entier(faits), f"{(100 * faits / total):.1f} %" if total else "—")
     st.metric("Restants", formater_entier(reste))
 
-    if ROLE == "manager":
+    if PEUT_PILOTER:
         st.divider()
         st.header("Par commerciale")
         for nom in COMMERCIALES:
@@ -1083,8 +1127,8 @@ with st.sidebar:
                 st.error(f"Rythme équipe ({rythme_global:.0f}/j) sous l'objectif "
                          f"de ~{objectif - rythme_global:.0f}/j.")
 
-    # Filtres : uniquement pour celles qui ont une file d'appel.
-    if ROLE == "commercial":
+    # Filtres : uniquement pour les profils qui ont une file d'appel.
+    if PEUT_TRAITER:
         st.divider()
         st.header("🔎 Accès direct")
         code_direct = st.text_input("Code client exact")
@@ -1093,15 +1137,15 @@ with st.sidebar:
         st.header("Filtres")
         f_traitement = st.multiselect(
             "Traitement",
-            ["Non traité"] + [f"Traité par {n}" for n in COMMERCIALES],
+            ["Non traité"] + [f"Traité par {n}" for n in TRAITANTS],
             default=["Non traité"],
             help="Le filtre qui évite les doublons : « Non traité » ne montre que les fiches "
                  "que personne n'a encore prises.",
         )
         f_masquer_ouvertes = st.checkbox(
-            "Masquer les fiches ouvertes par ma collègue", value=True,
-            help=f"Une fiche consultée par quelqu'un d'autre depuis moins de {VERROU_MINUTES} minutes "
-                 "est retirée de votre file.",
+            "Masquer les fiches ouvertes par quelqu'un d'autre", value=True,
+            help=f"Une fiche consultée par une autre personne depuis moins de {VERROU_MINUTES} "
+                 "minutes est retirée de votre file.",
         )
         f_type = st.multiselect("Type de client", sorted(base["Type client"].unique()))
         f_statut = st.multiselect("Statut d'appel", STATUTS, default=["À appeler", "À rappeler"])
@@ -1114,8 +1158,9 @@ with st.sidebar:
 
     st.divider()
     with st.expander("⚙️ Réinitialisation (zone sensible)"):
-        if ROLE != "manager":
-            st.caption("Réservé au profil manager.")
+        if not PEUT_REINITIALISER:
+            st.caption("Réservé au profil manager, y compris pour l'administrateur : "
+                       "un effacement total ne doit jamais pouvoir partir d'un poste de saisie.")
         else:
             st.caption("Efface tout le suivi : appels et référents. Irréversible. Exporter avant.")
             confirme = st.checkbox("Je comprends que tout sera effacé")
@@ -1152,12 +1197,12 @@ if acces_direct:
         file_appel = direct.reset_index(drop=True)
         st.session_state.idx = 0
 
-if not acces_direct and ROLE == "commercial":
+if not acces_direct and PEUT_TRAITER:
     if f_traitement:
         masques = []
         if "Non traité" in f_traitement:
             masques.append(file_appel["traite_par"].astype(str).str.strip() == "")
-        for nom in COMMERCIALES:
+        for nom in TRAITANTS:
             if f"Traité par {nom}" in f_traitement:
                 masques.append(file_appel["traite_par"] == nom)
         if masques:
@@ -1190,16 +1235,26 @@ if not acces_direct and ROLE == "commercial":
 # ONGLETS SELON LE RÔLE
 # ─────────────────────────────────────────────────────────────────────────────
 
-if ROLE == "commercial":
-    onglet_appel, onglet_adr, onglet_export = st.tabs(
-        ["☎️  Appels clients", "📦  Points de livraison", "⬇️  Export"]
-    )
-else:
-    (onglet_dash,) = st.tabs(["📊  Tableau de bord"])
+# Les onglets visibles découlent des droits, pas d'un rôle en dur : le profil
+# administrateur voit les quatre, les autres voient les leurs.
+libelles_onglets = []
+if PEUT_TRAITER:
+    libelles_onglets += ["☎️  Appels clients", "📦  Points de livraison", "⬇️  Export"]
+if PEUT_PILOTER:
+    libelles_onglets += ["📊  Tableau de bord"]
+
+onglets = st.tabs(libelles_onglets)
+onglet_appel = onglet_adr = onglet_export = onglet_dash = None
+curseur = 0
+if PEUT_TRAITER:
+    onglet_appel, onglet_adr, onglet_export = onglets[curseur:curseur + 3]
+    curseur += 3
+if PEUT_PILOTER:
+    onglet_dash = onglets[curseur]
 
 
-# ── ONGLET APPELS (commerciales) ─────────────────────────────────────────────
-if ROLE == "commercial":
+# ── ONGLETS DE TRAVAIL (commerciales et administrateur) ──────────────────────
+if PEUT_TRAITER:
     with onglet_appel:
         if file_appel.empty:
             st.success("Aucun client dans la file avec ces filtres. 🎉")
@@ -1390,7 +1445,7 @@ if ROLE == "commercial":
                 fa1, fa2 = st.columns(2)
                 filtre_adr = fa1.multiselect("Statut", STATUTS_ADRESSE, default=["À vérifier"])
                 filtre_qui = fa2.multiselect(
-                    "Traitement", ["Non vérifié"] + [f"Vérifié par {n}" for n in COMMERCIALES],
+                    "Traitement", ["Non vérifié"] + [f"Vérifié par {n}" for n in TRAITANTS],
                     default=[])
                 if filtre_adr:
                     vue = vue[vue["statut_adr"].isin(filtre_adr)]
@@ -1398,7 +1453,7 @@ if ROLE == "commercial":
                     masques = []
                     if "Non vérifié" in filtre_qui:
                         masques.append(vue["traite_par"].astype(str).str.strip() == "")
-                    for nom in COMMERCIALES:
+                    for nom in TRAITANTS:
                         if f"Vérifié par {nom}" in filtre_qui:
                             masques.append(vue["traite_par"] == nom)
                     if masques:
@@ -1549,8 +1604,8 @@ if ROLE == "commercial":
                 st.rerun()
 
 
-# ── ONGLET TABLEAU DE BORD (manager) ─────────────────────────────────────────
-else:
+# ── ONGLET TABLEAU DE BORD (manager et administrateur) ───────────────────────
+if PEUT_PILOTER:
     with onglet_dash:
         st.subheader("🎯 Objectif pour tenir l'échéance")
         st.caption(f"Échéance : émission de la facturation électronique au "
@@ -1628,6 +1683,18 @@ else:
         non_traitees = int((base["traite_par"].astype(str).str.strip() == "").sum())
         st.caption(f"{formater_entier(non_traitees)} fiche(s) ne sont encore attribuées à personne.")
 
+        # L'activité des profils administrateurs est comptée dans l'avancement
+        # global, mais signalée à part : le suivi des commerciales reste lisible.
+        admins = [n for n, prof in PROFILS.items() if prof["role"] == "admin"]
+        for nom in admins:
+            s_admin = stats_utilisateur(suivi, suivi_adr, nom)
+            if s_admin["fiches"] or s_admin["points"]:
+                st.caption(
+                    f"Hors périmètre commercial : {formater_entier(s_admin['fiches'])} fiche(s) "
+                    f"et {formater_entier(s_admin['points'])} point(s) de livraison traités par "
+                    f"{nom} (administrateur)."
+                )
+
         # Activité quotidienne comparée
         if not suivi.empty and (suivi["traite_par"] != "").any():
             activite = suivi[suivi["traite_par"].isin(COMMERCIALES)].copy()
@@ -1683,7 +1750,13 @@ else:
                 )
 
         st.divider()
-        st.caption(
-            "Profil manager : lecture seule. Les exports sont réalisés par les commerciales "
-            "depuis leur onglet « Export »."
-        )
+        if ROLE == "manager":
+            st.caption(
+                "Profil manager : lecture seule. Les exports sont réalisés par les commerciales "
+                "depuis leur onglet « Export »."
+            )
+        else:
+            st.caption(
+                "Profil administrateur : accès complet aux onglets de travail et de pilotage. "
+                "La réinitialisation reste réservée au profil manager."
+            )

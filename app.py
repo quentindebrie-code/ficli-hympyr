@@ -42,8 +42,10 @@ from __future__ import annotations
 import hashlib
 import io
 import os
+import random
 import re
 import sqlite3
+import time
 import datetime as dt
 from contextlib import contextmanager
 from pathlib import Path
@@ -278,16 +280,16 @@ def pastille_traitement(traite_par: str) -> str:
 
 @contextmanager
 def connexion():
-    """Connexion configurée pour supporter plusieurs utilisateurs simultanés.
+    """Connexion à la base de suivi.
 
-    WAL autorise les lectures pendant une écriture ; busy_timeout évite l'erreur
-    « database is locked » quand deux personnes enregistrent en même temps.
+    Le mode WAL n'est PAS réglé ici : c'est un réglage persistant du fichier,
+    posé une fois à l'initialisation. L'exécuter à chaque connexion réclamait un
+    verrou exclusif momentané — à plusieurs utilisateurs, les connexions
+    s'attendaient les unes les autres et l'application semblait figée.
     """
     con = sqlite3.connect(DB_PATH, timeout=30, check_same_thread=False)
     try:
-        con.execute("PRAGMA journal_mode=WAL")
         con.execute("PRAGMA busy_timeout=30000")
-        con.execute("PRAGMA synchronous=NORMAL")
         yield con
         con.commit()
     finally:
@@ -295,6 +297,15 @@ def connexion():
 
 
 def initialiser_base() -> None:
+    # Réglages persistants du fichier de base : posés une seule fois.
+    con = sqlite3.connect(DB_PATH, timeout=30, check_same_thread=False)
+    try:
+        con.execute("PRAGMA journal_mode=WAL")
+        con.execute("PRAGMA synchronous=NORMAL")
+        con.commit()
+    finally:
+        con.close()
+
     with connexion() as con:
         con.execute("""
             CREATE TABLE IF NOT EXISTS suivi (
@@ -535,9 +546,29 @@ def poser_verrou(type_fiche: str, code: str, utilisateur: str) -> None:
             "ON CONFLICT(cle) DO UPDATE SET utilisateur=excluded.utilisateur, depuis=excluded.depuis",
             (f"{type_fiche}:{code}:{utilisateur}", type_fiche, str(code), utilisateur, maintenant_iso()),
         )
-        # Purge des verrous expirés, pour que la table ne gonfle pas.
-        limite = (dt.datetime.now() - dt.timedelta(minutes=VERROU_MINUTES * 3)).isoformat(timespec="seconds")
-        con.execute("DELETE FROM verrous WHERE depuis < ?", (limite,))
+        # Purge occasionnelle seulement : la faire à chaque pose ajoutait un
+        # balayage de table à chaque interaction, pour un gain nul.
+        if random.random() < 0.05:
+            limite = (dt.datetime.now() - dt.timedelta(minutes=VERROU_MINUTES * 3)).isoformat(timespec="seconds")
+            con.execute("DELETE FROM verrous WHERE depuis < ?", (limite,))
+
+
+def marquer_presence(type_fiche: str, code: str, utilisateur: str) -> None:
+    """Pose le verrou et mémorise la position, au plus une fois par minute.
+
+    Sans cette limite, chaque clic déclenchait deux écritures en base : le
+    verrou et la dernière fiche consultée. Multiplié par trois utilisateurs et
+    par le nombre de rafraîchissements de Streamlit, c'était la principale
+    source de lenteur.
+    """
+    cle = type_fiche + ":" + str(code)
+    precedent = st.session_state.get("_presence")
+    if precedent and precedent[0] == cle and (time.time() - precedent[1]) < 60:
+        return
+    st.session_state["_presence"] = (cle, time.time())
+    poser_verrou(type_fiche, code, utilisateur)
+    if type_fiche == "client":
+        ecrire_meta("derniere_fiche_" + utilisateur, str(code))
 
 
 def autres_sur_la_fiche(type_fiche: str, code: str, utilisateur: str) -> list[tuple[str, int]]:
@@ -705,10 +736,10 @@ def coffre_fichier() -> dict:
     survit à la reconnexion. C'est ce qui évite que l'outil « se réinitialise
     tout seul ».
     """
-    return {"contenu": None, "nom": "", "charge_le": "", "restaure": False}
+    return {"contenu": None, "nom": "", "charge_le": "", "restaure": False,
+            "clients": None, "adresses": None, "col_code": None}
 
 
-@st.cache_data(show_spinner=False)
 def lire_fichier(contenu: bytes):
     tampon = io.BytesIO(contenu)
     xls = pd.ExcelFile(tampon, engine="openpyxl")
@@ -778,6 +809,21 @@ def normaliser_adresses(adresses: pd.DataFrame) -> pd.DataFrame:
         if c not in adresses.columns:
             adresses[c] = ""
     return adresses
+
+
+def preparer_fichier() -> None:
+    """Lit et normalise le fichier une seule fois, à son chargement.
+
+    Auparavant, chaque rafraîchissement repassait par le cache de Streamlit en
+    lui donnant le contenu du fichier comme clé : plusieurs mégaoctets à
+    empreinter à chaque interaction, puis une renormalisation complète des
+    colonnes. Le résultat est désormais conservé avec le fichier lui-même.
+    """
+    clients_bruts, adresses_brutes = lire_fichier(coffre["contenu"])
+    clients, col_code = normaliser_clients(clients_bruts)
+    coffre["clients"] = clients
+    coffre["col_code"] = col_code
+    coffre["adresses"] = normaliser_adresses(adresses_brutes)
 
 
 def priorite(type_client: str) -> int:
@@ -1052,12 +1098,13 @@ def afficher_demo(role: str) -> None:
             st.session_state.demo_active = False
             st.rerun()
 
-    if hasattr(st, "dialog"):
-        st.dialog("Visite guidée de l'outil", width="large")(contenu)()
-    else:  # repli pour les versions de Streamlit sans pop-up natif
-        with st.container(border=True):
-            st.subheader("Visite guidée de l'outil")
-            contenu()
+    # Rendu dans le flux de la page plutôt que dans une fenêtre modale.
+    # st.dialog était rappelé à chaque exécution du script tant que la démo
+    # restait ouverte, et chacun de ses boutons relançait le script : sur un
+    # serveur chargé, l'application tournait en boucle sans jamais se stabiliser.
+    with st.container(border=True):
+        st.subheader("Visite guidée de l'outil")
+        contenu()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1108,6 +1155,7 @@ def ecran_connexion() -> None:
                     coffre["contenu"] = f_mere.getvalue()
                     coffre["nom"] = f_mere.name
                     coffre["charge_le"] = maintenant_iso()
+                    coffre["clients"] = None      # sera préparé au premier affichage
                 messages = []
                 if not reprendre:
                     messages.append(f"{importer_suivi_clients_csv(f_suivi)} fiches clients restaurées")
@@ -1146,6 +1194,7 @@ def ecran_connexion() -> None:
         if st.button("📂 Charger d'autres fichiers"):
             coffre["contenu"] = None
             coffre["restaure"] = False
+            coffre["clients"] = None
             st.cache_data.clear()
             st.rerun()
     st.stop()
@@ -1168,12 +1217,14 @@ PEUT_REINITIALISER = ROLE in ROLES_RESET         # exclusif au manager
 # CHARGEMENT DES DONNÉES
 # ─────────────────────────────────────────────────────────────────────────────
 
-clients_bruts, adresses_brutes = lire_fichier(coffre["contenu"])
-clients, col_code = normaliser_clients(clients_bruts)
+if coffre.get("clients") is None:
+    preparer_fichier()
+clients = coffre["clients"]
+col_code = coffre["col_code"]
+adresses = coffre["adresses"]
 if col_code is None:
     st.error("La feuille « Clients » doit contenir une colonne « Code client ».")
     st.stop()
-adresses = normaliser_adresses(adresses_brutes)
 
 suivi = charger_suivi()
 suivi_adr = charger_suivi_adresses()
@@ -1188,6 +1239,11 @@ base["priorite"] = base["Type client"].map(priorite)
 modifs_en_attente = nb_modifs_depuis_export()
 rythme_global = calculer_rythme(suivi)
 stats = {nom: stats_utilisateur(suivi, suivi_adr, nom) for nom in COMMERCIALES}
+
+# Calculés une seule fois : la barre latérale et le bandeau les réutilisent.
+PEUT_TRAITER_TMP = ROLE in ("commercial", "admin")
+mes_rappels = rappels_dus(base, UTILISATEUR) if PEUT_TRAITER_TMP else pd.DataFrame()
+tous_rappels = rappels_dus(base)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1230,7 +1286,7 @@ with st.sidebar:
         st.metric("Fiches traitées aujourd'hui", formater_entier(moi["aujourdhui"]))
         st.metric("Fiches traitées au total", formater_entier(moi["fiches"]))
         st.metric("Points de livraison vérifiés", formater_entier(moi["points"]))
-        nb_dus = len(rappels_dus(base, UTILISATEUR))
+        nb_dus = len(mes_rappels)
         if nb_dus:
             st.error(f"⏰ **{nb_dus} rappel(s) à passer aujourd'hui** — voir le bandeau en haut de page.")
         elif moi["a_rappeler"]:
@@ -1344,8 +1400,6 @@ if st.session_state.get("demo_active"):
 # peut pas manquer, quel que soit l'onglet ouvert.
 # ─────────────────────────────────────────────────────────────────────────────
 
-mes_rappels = rappels_dus(base, UTILISATEUR) if PEUT_TRAITER else pd.DataFrame()
-tous_rappels = rappels_dus(base)
 aujourdhui = dt.date.today()
 
 def _detail_rappels(df: pd.DataFrame, avec_bouton: bool) -> None:
@@ -1497,8 +1551,7 @@ if PEUT_TRAITER:
 
             ligne = file_appel.iloc[st.session_state.idx]
             code = str(ligne[col_code])
-            poser_verrou("client", code, UTILISATEUR)
-            ecrire_meta(f"derniere_fiche_{UTILISATEUR}", code)
+            marquer_presence("client", code, UTILISATEUR)
 
             # Bandeau si quelqu'un d'autre est sur la même fiche.
             for qui, minutes in autres_sur_la_fiche("client", code, UTILISATEUR):
@@ -1773,7 +1826,7 @@ if PEUT_TRAITER:
 
                 point = vue.iloc[st.session_state.idx_adr]
                 code_adr = str(point["Code adresse"])
-                poser_verrou("adresse", code_adr, UTILISATEUR)
+                marquer_presence("adresse", code_adr, UTILISATEUR)
 
                 for qui, minutes in autres_sur_la_fiche("adresse", code_adr, UTILISATEUR):
                     st.markdown(

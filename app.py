@@ -1153,10 +1153,102 @@ def grille_mensuelle(rappels: pd.DataFrame, prefixe: str) -> None:
 
     du_mois = rappels[(rappels["date_rappel"] >= premier) & (rappels["date_rappel"] <= dernier)] \
         if not rappels.empty else rappels
-    if not du_mois.empty:
-        st.caption(str(len(du_mois)) + " rappel(s) programmé(s) sur le mois affiché.")
-    else:
+    if du_mois.empty:
         st.caption("Aucun rappel programmé sur ce mois.")
+        return
+    st.caption(str(len(du_mois)) + " rappel(s) programmé(s) sur le mois affiché.")
+
+    # Sous la grille : un bouton par journée concernée, puis la liste des
+    # clients. La couleur d'une case montre une charge ; seule cette liste
+    # permet de décrocher le téléphone.
+    st.divider()
+    jour_choisi = selecteur_journees(rappels, premier, dernier, prefixe)
+    if jour_choisi:
+        du_jour = rappels[rappels["date_rappel"] == jour_choisi]
+        titre = str(len(du_jour)) + " client(s) à rappeler le " + jour_choisi.strftime("%d/%m/%Y")
+        if jour_choisi < dt.date.today():
+            titre += "  —  date dépassée"
+        tableau_rappels(du_jour, col_code or "Code client", titre)
+        detail = []
+        for nom in COMMERCIALES:
+            n = int((du_jour["traite_par"] == nom).sum())
+            if n:
+                detail.append(nom + " : " + str(n))
+        if detail:
+            st.caption("Répartition — " + "  ·  ".join(detail) + ".")
+
+
+def tableau_rappels(rappels: pd.DataFrame, col_code: str, titre: str = "") -> None:
+    """Liste des clients à rappeler : qui appeler, à quel numéro, et pourquoi.
+
+    C'est ce que le calendrier doit produire. Une case colorée indique une
+    charge ; seule cette liste permet de décrocher le téléphone.
+    """
+    if rappels.empty:
+        st.info("Aucun rappel pour cette date.")
+        return
+    if titre:
+        st.markdown("**" + titre + "**")
+
+    vue = rappels.copy()
+    vue["Date de rappel"] = vue["date_rappel"].map(lambda d: d.strftime("%d/%m/%Y"))
+    vue["Traité par"] = vue["traite_par"].replace("", "—")
+    colonnes = {
+        col_code: "Code client",
+        "Raison sociale / Nom": "Client",
+        "Ville": "Ville",
+        "Téléphone 1": "Téléphone",
+        "Traité par": "Noté par",
+        "Date de rappel": "Date de rappel",
+        "note": "Notes de l'appel précédent",
+    }
+    for c in colonnes:
+        if c not in vue.columns:
+            vue[c] = ""
+    st.dataframe(vue[list(colonnes)].rename(columns=colonnes),
+                 hide_index=True, use_container_width=True)
+
+
+def selecteur_journees(rappels: pd.DataFrame, premier: dt.date, dernier: dt.date,
+                       prefixe: str) -> dt.date | None:
+    """Boutons de sélection, un par journée comportant des rappels.
+
+    Seules les journées concernées ont un bouton : sur un mois, cela fait une
+    poignée d'éléments au lieu des quarante-deux cases de la grille.
+    """
+    if rappels.empty:
+        return None
+    jours = sorted({d for d in rappels["date_rappel"] if premier <= d <= dernier})
+    if not jours:
+        return None
+
+    cle_etat = prefixe + "_jour_detail"
+    st.markdown("**Journées comportant des rappels — cliquez pour voir les clients**")
+    par_ligne = 6
+    for debut in range(0, len(jours), par_ligne):
+        colonnes = st.columns(par_ligne)
+        for col, jour in zip(colonnes, jours[debut:debut + par_ligne]):
+            n = int((rappels["date_rappel"] == jour).sum())
+            marque = "⏰ " if jour < dt.date.today() else ""
+            libelle = marque + jour.strftime("%d/%m") + " · " + str(n)
+            actif = st.session_state.get(cle_etat) == jour.isoformat()
+            if col.button(libelle, key=prefixe + "_j_" + jour.isoformat(),
+                          use_container_width=True,
+                          type="primary" if actif else "secondary"):
+                # Un second clic sur la même journée referme le détail.
+                if actif:
+                    st.session_state.pop(cle_etat, None)
+                else:
+                    st.session_state[cle_etat] = jour.isoformat()
+                st.rerun()
+
+    choisi = st.session_state.get(cle_etat)
+    if choisi:
+        try:
+            return dt.date.fromisoformat(choisi)
+        except ValueError:
+            st.session_state.pop(cle_etat, None)
+    return None
 
 
 def stats_utilisateur(suivi_df: pd.DataFrame, suivi_adr: pd.DataFrame, nom: str) -> dict:
@@ -1472,7 +1564,8 @@ with st.sidebar:
         st.rerun()
     if sc2.button("🚪 Déconnexion", use_container_width=True):
         for cle in ("utilisateur", "role", "idx", "idx_adr", "demo_active",
-                    "demo_etape", "saut_code", "jour_rappel", "cal_decalage"):
+                    "demo_etape", "saut_code", "jour_rappel", "cal_decalage",
+                    "grille_jour_detail", "bande_jour_detail"):
             st.session_state.pop(cle, None)
         st.rerun()
 
@@ -1741,9 +1834,22 @@ if PEUT_TRAITER:
             bande_sept_jours(mon_calendrier, "bande")
 
         if st.session_state.get("jour_rappel"):
-            libelle = ("rappels en retard" if st.session_state.jour_rappel == "retard"
-                       else "rappels du " + jolie_date(st.session_state.jour_rappel))
-            st.info("File filtrée sur les " + libelle + " — " + str(len(file_appel)) + " fiche(s).")
+            choix = st.session_state.jour_rappel
+            if choix == "retard":
+                libelle = "rappels en retard"
+                du_jour = (mon_calendrier[mon_calendrier["date_rappel"] < dt.date.today()]
+                           if not mon_calendrier.empty else mon_calendrier)
+            else:
+                libelle = "rappels du " + jolie_date(choix)
+                cible = dt.date.fromisoformat(choix)
+                du_jour = (mon_calendrier[mon_calendrier["date_rappel"] == cible]
+                           if not mon_calendrier.empty else mon_calendrier)
+
+            st.info("File filtrée sur les " + libelle + " — " + str(len(file_appel)) + " fiche(s). "
+                    "Les fiches ci-dessous s'enchaînent normalement avec « Enregistrer ».")
+            # Qui appeler, à quel numéro, et ce qui avait été noté la fois d'avant.
+            with st.expander("📋 La liste des clients à rappeler", expanded=True):
+                tableau_rappels(du_jour, col_code)
             if st.button("↩︎ Revenir à ma file d'appel", key="retour_jour"):
                 st.session_state.pop("jour_rappel", None)
                 st.session_state.pop("idx", None)
@@ -2335,7 +2441,7 @@ if PEUT_PILOTER:
         st.subheader("🗓️ Calendrier des rappels")
         st.caption("Alimenté par les dates que les commerciales inscrivent dans les fiches. "
                    "C'est la charge à venir, que les autres écrans ne montrent pas.")
-        grille_mensuelle(calendrier_equipe, "grille")
+        grille_mensuelle(calendrier_equipe, "grille", col_code)
 
         # ── Journal des interventions manuelles ─────────────────────────────
         journal = charger_journal()

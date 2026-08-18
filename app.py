@@ -338,6 +338,23 @@ def initialiser_base() -> None:
             )
         """)
         con.execute("CREATE TABLE IF NOT EXISTS meta (cle TEXT PRIMARY KEY, valeur TEXT)")
+        # Journal des appels : une ligne par enregistrement, jamais écrasée.
+        # La table « suivi » ne conserve qu'un état — une ligne par client,
+        # remplacée à chaque modification. Impossible d'en déduire combien
+        # d'appels ont été passés un jour donné : une réattribution en masse y
+        # ressemble à des centaines d'appels. D'où ce journal séparé.
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS appels (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                horodatage  TEXT,
+                jour        TEXT,
+                utilisateur TEXT,
+                type_fiche  TEXT,
+                code        TEXT,
+                statut      TEXT,
+                origine     TEXT
+            )
+        """)
         con.execute("""
             CREATE TABLE IF NOT EXISTS journal (
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -369,6 +386,7 @@ def initialiser_base() -> None:
         con.execute("CREATE INDEX IF NOT EXISTS idx_suivi_maj ON suivi(maj_le)")
         con.execute("CREATE INDEX IF NOT EXISTS idx_suivi_qui ON suivi(traite_par)")
         con.execute("CREATE INDEX IF NOT EXISTS idx_adr_maj ON suivi_adresses(maj_le)")
+        con.execute("CREATE INDEX IF NOT EXISTS idx_appels_jour ON appels(jour, utilisateur)")
 
 
 initialiser_base()
@@ -504,11 +522,65 @@ def reinitialiser_tout(auteur: str = "") -> None:
     l'effacement : sans cela, le bouton annoncerait tout effacer et laisserait
     un historique orphelin renvoyant à des fiches disparues."""
     with connexion() as con:
-        for t in ("suivi", "suivi_adresses", "meta", "verrous", "journal"):
+        for t in ("suivi", "suivi_adresses", "meta", "verrous", "journal", "appels"):
             con.execute(f"DELETE FROM {t}")
     if auteur:
         journaliser(auteur, "Réinitialisation complète", "—",
                     "Suivi, référents et journal antérieur effacés.")
+
+
+# Origines possibles d'un événement. Seule « appel » compte comme une prise de
+# contact réelle : c'est ce qui distingue le travail des commerciales des
+# corrections administratives.
+ORIGINE_APPEL = "appel"
+ORIGINE_REATTRIBUTION = "reattribution"
+ORIGINE_IMPORT = "import"
+
+
+def journaliser_appel(utilisateur: str, type_fiche: str, code: str,
+                      statut: str, origine: str = ORIGINE_APPEL) -> None:
+    """Inscrit un événement au journal des appels.
+
+    Appelée à chaque enregistrement depuis un formulaire. Les réattributions et
+    les restaurations de sauvegarde y figurent aussi, mais sous une autre
+    origine : elles ne doivent jamais gonfler le compteur d'appels.
+    """
+    maintenant = dt.datetime.now()
+    with connexion() as con:
+        con.execute(
+            "INSERT INTO appels (horodatage, jour, utilisateur, type_fiche, code, statut, origine) "
+            "VALUES (?,?,?,?,?,?,?)",
+            (maintenant.isoformat(timespec="seconds"), maintenant.date().isoformat(),
+             utilisateur, type_fiche, str(code), statut, origine),
+        )
+
+
+def charger_appels(depuis: dt.date | None = None) -> pd.DataFrame:
+    """Journal des appels, éventuellement borné dans le temps."""
+    requete = "SELECT jour, utilisateur, type_fiche, code, statut, origine, horodatage FROM appels"
+    parametres = ()
+    if depuis:
+        requete += " WHERE jour >= ?"
+        parametres = (depuis.isoformat(),)
+    with connexion() as con:
+        return pd.read_sql(requete, con, params=parametres, dtype=str).fillna("")
+
+
+def compter_appels(jour: dt.date, utilisateur: str | None = None,
+                   type_fiche: str = "client") -> int:
+    """Nombre de clients distincts appelés un jour donné.
+
+    On compte les clients distincts, pas les enregistrements : corriger deux
+    fois la même fiche ne fait pas deux appels.
+    """
+    requete = ("SELECT COUNT(DISTINCT code) FROM appels "
+               "WHERE jour = ? AND origine = ? AND type_fiche = ?")
+    parametres = [jour.isoformat(), ORIGINE_APPEL, type_fiche]
+    if utilisateur:
+        requete += " AND utilisateur = ?"
+        parametres.append(utilisateur)
+    with connexion() as con:
+        return int(con.execute(requete, parametres).fetchone()[0])
 
 
 def journaliser(auteur: str, action: str, cible: str, detail: str = "") -> None:
@@ -543,6 +615,7 @@ def reattribuer(code: str, traitant: str, statut: str, auteur: str, ancien: dict
             "statut=excluded.statut, traite_par=excluded.traite_par, maj_le=excluded.maj_le",
             (str(code), statut, traitant, maintenant_iso()),
         )
+    journaliser_appel(auteur, "client", code, statut, ORIGINE_REATTRIBUTION)
     journaliser(
         auteur, "Réattribution de fiche", code,
         f"traité par « {ancien.get('traite_par') or 'personne'} » → « {traitant or 'personne'} » ; "
@@ -1256,25 +1329,67 @@ def selecteur_journees(rappels: pd.DataFrame, premier: dt.date, dernier: dt.date
     return None
 
 
+def rapport_journalier(jours: int = 30) -> dict:
+    """Reporting des appels, jour par jour et par commerciale.
+
+    Ne compte que les événements d'origine « appel » : les réattributions, les
+    corrections et les restaurations de sauvegarde sont exclues.
+    """
+    depuis = dt.date.today() - dt.timedelta(days=jours - 1)
+    brut = charger_appels(depuis)
+    if brut.empty:
+        return {"vide": True, "depuis": depuis}
+
+    appels = brut[(brut["origine"] == ORIGINE_APPEL) & (brut["type_fiche"] == "client")]
+    if appels.empty:
+        return {"vide": True, "depuis": depuis}
+
+    # Un client appelé deux fois le même jour ne compte qu'une fois.
+    uniques = appels.drop_duplicates(subset=["jour", "utilisateur", "code"])
+
+    par_jour = (uniques.pivot_table(index="jour", columns="utilisateur",
+                                    values="code", aggfunc="count")
+                .fillna(0).astype(int).sort_index())
+    # Toutes les journées de la période, y compris celles sans aucun appel.
+    calendrier = pd.date_range(depuis, dt.date.today(), freq="D").strftime("%Y-%m-%d")
+    par_jour = par_jour.reindex(calendrier, fill_value=0)
+    par_jour.index.name = "jour"
+
+    par_statut = (uniques.pivot_table(index="utilisateur", columns="statut",
+                                      values="code", aggfunc="count")
+                  .fillna(0).astype(int))
+
+    points = brut[(brut["origine"] == ORIGINE_APPEL) & (brut["type_fiche"] == "adresse")]
+    points_uniques = points.drop_duplicates(subset=["jour", "utilisateur", "code"])
+
+    return {
+        "vide": False,
+        "depuis": depuis,
+        "par_jour": par_jour,
+        "par_statut": par_statut,
+        "total": int(len(uniques)),
+        "points": int(len(points_uniques)),
+        "jours_actifs": int((par_jour.sum(axis=1) > 0).sum()),
+        "hors_appels": int(len(brut[brut["origine"] != ORIGINE_APPEL])),
+    }
+
+
 def stats_utilisateur(suivi_df: pd.DataFrame, suivi_adr: pd.DataFrame, nom: str) -> dict:
     """Indicateurs d'activité d'une commerciale."""
     aujourdhui = dt.date.today()
     s = suivi_df[suivi_df["traite_par"] == nom] if not suivi_df.empty else pd.DataFrame()
     a = suivi_adr[suivi_adr["traite_par"] == nom] if not suivi_adr.empty else pd.DataFrame()
 
-    def du_jour(df):
-        if df.empty:
-            return 0
-        jours = pd.to_datetime(df["maj_le"], errors="coerce").dt.date
-        return int((jours == aujourdhui).sum())
-
     return {
         "fiches": len(s),
         "terminees": int(s["statut"].isin(STATUTS_TERMINES).sum()) if not s.empty else 0,
-        "aujourdhui": du_jour(s),
+        # Compté depuis le journal des appels, et non depuis la date de dernière
+        # modification de la fiche : une réattribution en masse ne doit pas
+        # apparaître comme une journée de deux cents appels.
+        "aujourdhui": compter_appels(aujourdhui, nom, "client"),
         "a_rappeler": int((s["statut"] == "À rappeler").sum()) if not s.empty else 0,
         "points": len(a),
-        "points_aujourdhui": du_jour(a),
+        "points_aujourdhui": compter_appels(aujourdhui, nom, "adresse"),
         "rythme": calculer_rythme(suivi_df, nom),
     }
 
@@ -1578,8 +1693,10 @@ with st.sidebar:
         st.divider()
         st.header("Mes chiffres")
         moi = stats_utilisateur(suivi, suivi_adr, UTILISATEUR)
-        st.metric("Fiches traitées aujourd'hui", formater_entier(moi["aujourdhui"]))
-        st.metric("Fiches traitées au total", formater_entier(moi["fiches"]))
+        st.metric("Appels enregistrés aujourd'hui", formater_entier(moi["aujourdhui"]),
+                  help="Clients distincts appelés depuis ce matin. Les corrections "
+                       "administratives n'y figurent pas.")
+        st.metric("Fiches à votre nom", formater_entier(moi["fiches"]))
         st.metric("Points de livraison vérifiés", formater_entier(moi["points"]))
         nb_dus = len(mes_rappels)
         if nb_dus:
@@ -2047,6 +2164,7 @@ if PEUT_TRAITER:
                             motif_sortie="" if motif_sortie == "—" else motif_sortie,
                             rappel_date="" if supprimer_rappel else (rappel.isoformat() if rappel else ""),
                         )
+                        journaliser_appel(UTILISATEUR, "client", code, statut)
                         sauvegarde_auto()
                         st.session_state.idx = min(len(file_appel) - 1, st.session_state.idx + 1)
                         st.rerun()
@@ -2226,6 +2344,7 @@ if PEUT_TRAITER:
                             referent=referent.strip(), tel_site=tel_site.strip(),
                             statut_adr=statut_adr, note_adr=note_adr.strip(),
                         )
+                        journaliser_appel(UTILISATEUR, "adresse", code_adr, statut_adr)
                         sauvegarde_auto()
                         st.session_state.idx_adr = min(len(vue) - 1, st.session_state.idx_adr + 1)
                         st.rerun()
@@ -2350,9 +2469,11 @@ if PEUT_PILOTER:
                 st.markdown(
                     f"<span class='pill' style='background:{PROFILS[nom]['couleur']}'>{nom}</span>",
                     unsafe_allow_html=True)
-                st.metric("Fiches traitées aujourd'hui", formater_entier(s["aujourdhui"]))
-                st.metric("Fiches traitées au total", formater_entier(s["terminees"]),
-                          help="Statuts Fait, Doublon ou Ancien client.")
+                st.metric("Appels enregistrés aujourd'hui", formater_entier(s["aujourdhui"]),
+                          help="Clients distincts appelés depuis ce matin, d'après le "
+                               "journal des appels. Une réattribution de fiches n'y compte pas.")
+                st.metric("Fiches terminées au total", formater_entier(s["terminees"]),
+                          help="Statuts Fait, Doublon ou Ancien client, quelle qu'en soit la date.")
                 st.metric("Rythme / jour actif", f"{s['rythme']:.0f}" if s["rythme"] else "—")
                 st.metric("Points de livraison vérifiés", formater_entier(s["points"]),
                           delta=f"+{s['points_aujourdhui']} aujourd'hui" if s["points_aujourdhui"] else None)
@@ -2439,6 +2560,63 @@ if PEUT_PILOTER:
                     .rename(columns={col_code: "Code client", "traite_par": "Traité par",
                                      "rappel_date": "À rappeler le", "note": "Notes"}),
                     hide_index=True, use_container_width=True,
+                )
+
+        # ── Reporting journalier des appels ─────────────────────────────────
+        st.divider()
+        st.subheader("📞 Reporting journalier des appels")
+        st.caption(
+            "Nombre de clients distincts appelés chaque jour. Compté depuis le journal "
+            "des appels : les réattributions de fiches et les corrections administratives "
+            "n'y figurent pas."
+        )
+
+        periode = st.radio("Période", ["7 jours", "30 jours", "90 jours"],
+                           horizontal=True, index=1, key="periode_rapport")
+        rapport = rapport_journalier({"7 jours": 7, "30 jours": 30, "90 jours": 90}[periode])
+
+        if rapport["vide"]:
+            st.info(
+                "Aucun appel enregistré sur cette période. Le journal des appels démarre "
+                "à l'installation de cette version : les appels antérieurs n'y figurent pas, "
+                "car rien ne permettait de les distinguer des modifications de fiches. "
+                "Le compteur devient fiable dès aujourd'hui."
+            )
+        else:
+            r1, r2, r3, r4 = st.columns(4)
+            r1.metric("Appels sur la période", formater_entier(rapport["total"]))
+            r2.metric("Jours travaillés", formater_entier(rapport["jours_actifs"]))
+            moyenne = rapport["total"] / rapport["jours_actifs"] if rapport["jours_actifs"] else 0
+            r3.metric("Moyenne par jour travaillé", f"{moyenne:.0f}")
+            r4.metric("Points de livraison vérifiés", formater_entier(rapport["points"]))
+
+            st.markdown("##### Appels par jour et par commerciale")
+            st.bar_chart(rapport["par_jour"])
+
+            tableau = rapport["par_jour"].copy()
+            tableau["Total"] = tableau.sum(axis=1)
+            lisible = tableau.reset_index()
+            lisible["jour"] = pd.to_datetime(lisible["jour"]).dt.strftime("%a %d/%m")
+            st.dataframe(lisible.rename(columns={"jour": "Jour"}).iloc[::-1],
+                         hide_index=True, use_container_width=True)
+
+            if not rapport["par_statut"].empty:
+                st.markdown("##### Résultat des appels, par commerciale")
+                st.dataframe(rapport["par_statut"].reset_index()
+                             .rename(columns={"utilisateur": "Commerciale"}),
+                             hide_index=True, use_container_width=True)
+
+            st.download_button(
+                "⬇️ Télécharger le reporting (CSV)",
+                tableau.to_csv(sep=";").encode("utf-8-sig"),
+                file_name=f"appels_hympyr_{dt.date.today():%Y%m%d}.csv",
+                mime="text/csv",
+            )
+
+            if rapport["hors_appels"]:
+                st.caption(
+                    f"{formater_entier(rapport['hors_appels'])} opération(s) administrative(s) "
+                    "sur la période — réattributions et restaurations — exclues de ce comptage."
                 )
 
         # ── Calendrier des rappels ──────────────────────────────────────────

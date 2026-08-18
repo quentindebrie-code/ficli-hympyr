@@ -163,6 +163,20 @@ st.markdown(
   .bandeau-verrou {{ background:#fff7ed; border:1px solid #f0c48a; border-left:5px solid {ORANGE};
                      border-radius:10px; padding:12px 16px; margin-bottom:12px;
                      font-size:0.92rem; color:#7c3f0a; }}
+  .cal-case {{ border:1px solid #d1e8da; border-radius:8px; padding:6px 4px 5px;
+               text-align:center; min-height:58px; background:#fff; }}
+  .cal-case .j {{ font-size:0.66rem; color:#7a8c85; text-transform:uppercase; letter-spacing:.4px; }}
+  .cal-case .d {{ font-size:0.95rem; font-weight:700; color:{VERT_FONCE}; line-height:1.2; }}
+  .cal-case .n {{ font-size:0.72rem; font-weight:700; margin-top:2px; }}
+  .cal-case.vide {{ background:#fafcfb; border-style:dashed; }}
+  .cal-case.hors {{ opacity:.35; }}
+  .cal-case.leger  {{ background:#eef7f2; border-color:#bcdfcc; }}
+  .cal-case.moyen  {{ background:#d6ecdf; border-color:#8ecfab; }}
+  .cal-case.charge {{ background:#{ORANGE.lstrip('#')}22; border-color:{ORANGE}; }}
+  .cal-case.retard {{ background:#fdecea; border-color:#e8a49a; }}
+  .cal-case.retard .d {{ color:#b4472b; }}
+  .cal-case.aujourdhui {{ box-shadow:0 0 0 2px {VERT}; }}
+  .cal-pastille {{ display:inline-block; width:8px; height:8px; border-radius:50%; margin:0 1px; }}
   .demo-etape {{ background:{VERT_FONCE}; color:#fff; border-radius:10px;
                  padding:18px 20px; margin-bottom:14px; line-height:1.6; }}
   .demo-etape b {{ color:#8ED6AE; }}
@@ -965,6 +979,186 @@ def rappels_dus(base_df: pd.DataFrame, utilisateur: str | None = None) -> pd.Dat
     return df.sort_values("date_rappel")
 
 
+def rappels_planifies(base_df: pd.DataFrame, utilisateur: str | None = None) -> pd.DataFrame:
+    """Toutes les fiches portant une date de rappel, passées comme à venir.
+
+    Même source que le bandeau d'alerte : le champ rempli par les commerciales
+    dans le formulaire de résultat d'appel. Le calendrier ne fait que le lire.
+    """
+    if base_df.empty:
+        return base_df
+    df = base_df[(base_df["statut"] == "À rappeler")
+                 & (base_df["rappel_date"].astype(str).str.strip() != "")].copy()
+    if df.empty:
+        return df
+    df["date_rappel"] = pd.to_datetime(df["rappel_date"], errors="coerce").dt.date
+    df = df[df["date_rappel"].notna()]
+    if utilisateur:
+        df = df[df["traite_par"] == utilisateur]
+    return df.sort_values("date_rappel")
+
+
+def _classe_charge(nombre: int, jour: dt.date) -> str:
+    """Couleur d'une case selon la charge, le retard primant sur le volume."""
+    if nombre == 0:
+        return "vide"
+    if jour < dt.date.today():
+        return "retard"
+    if nombre >= 8:
+        return "charge"
+    if nombre >= 4:
+        return "moyen"
+    return "leger"
+
+
+def _pastilles(rappels_du_jour: pd.DataFrame) -> str:
+    """Une pastille par commerciale concernée, pour lire la répartition d'un coup."""
+    if rappels_du_jour.empty:
+        return ""
+    points = ""
+    for nom in COMMERCIALES:
+        n = int((rappels_du_jour["traite_par"] == nom).sum())
+        if n:
+            points += ("<span class='cal-pastille' title='" + nom + " : " + str(n)
+                       + "' style='background:" + PROFILS[nom]["couleur"] + "'></span>")
+    return points
+
+
+JOURS_SEMAINE = ["lun", "mar", "mer", "jeu", "ven", "sam", "dim"]
+MOIS_LONGS = ["janvier", "février", "mars", "avril", "mai", "juin",
+              "juillet", "août", "septembre", "octobre", "novembre", "décembre"]
+
+
+def bande_sept_jours(rappels: pd.DataFrame, prefixe: str) -> None:
+    """Sept prochains jours, au-dessus de la file d'appel.
+
+    Format volontairement compact : les commerciales travaillent à la semaine,
+    et cette bande ne doit pas repousser l'outil qu'elles utilisent réellement
+    hors de l'écran. Cliquer sur un jour filtre la file sur ses rappels.
+    """
+    aujourdhui = dt.date.today()
+    compte = rappels.groupby("date_rappel").size().to_dict() if not rappels.empty else {}
+    retard = sum(n for j, n in compte.items() if j < aujourdhui)
+
+    entete = "**Vos sept prochains jours**"
+    if retard:
+        entete += "  ·  :red[" + str(retard) + " rappel(s) en retard]"
+    st.markdown(entete)
+
+    colonnes = st.columns(7)
+    for i, col in enumerate(colonnes):
+        jour = aujourdhui + dt.timedelta(days=i)
+        n = int(compte.get(jour, 0))
+        classes = "cal-case " + _classe_charge(n, jour) + (" aujourdhui" if i == 0 else "")
+        col.markdown(
+            "<div class='" + classes + "'>"
+            "<div class='j'>" + JOURS_SEMAINE[jour.weekday()] + "</div>"
+            "<div class='d'>" + str(jour.day) + "</div>"
+            "<div class='n'>" + (str(n) if n else "—") + "</div></div>",
+            unsafe_allow_html=True,
+        )
+        if col.button("Voir" if n else "—", key=prefixe + "_" + jour.isoformat(),
+                      disabled=(n == 0), use_container_width=True):
+            st.session_state.jour_rappel = jour.isoformat()
+            st.session_state.pop("idx", None)
+            st.rerun()
+
+    if retard:
+        if st.button("⏰ Voir les " + str(retard) + " rappel(s) en retard", key=prefixe + "_retard"):
+            st.session_state.jour_rappel = "retard"
+            st.session_state.pop("idx", None)
+            st.rerun()
+
+
+def grille_mensuelle(rappels: pd.DataFrame, prefixe: str) -> None:
+    """Grille d'un mois entier, pour le pilotage.
+
+    Une case par jour : le nombre de rappels, et une pastille par commerciale
+    concernée. C'est la charge à venir, que rien d'autre dans l'outil ne montre.
+    """
+    if "cal_decalage" not in st.session_state:
+        st.session_state.cal_decalage = 0
+
+    aujourdhui = dt.date.today()
+    mois = aujourdhui.month - 1 + st.session_state.cal_decalage
+    annee = aujourdhui.year + mois // 12
+    mois = mois % 12 + 1
+
+    n1, n2, n3 = st.columns([1, 3, 1])
+    if n1.button("◀ Mois précédent", key=prefixe + "_prec", use_container_width=True):
+        st.session_state.cal_decalage -= 1
+        st.rerun()
+    if n3.button("Mois suivant ▶", key=prefixe + "_suiv", use_container_width=True):
+        st.session_state.cal_decalage += 1
+        st.rerun()
+    n2.markdown(
+        "<div style='text-align:center;font-weight:700;color:" + VERT_FONCE +
+        ";padding-top:6px'>" + MOIS_LONGS[mois - 1] + " " + str(annee) + "</div>",
+        unsafe_allow_html=True,
+    )
+
+    par_jour = {}
+    if not rappels.empty:
+        for jour, groupe in rappels.groupby("date_rappel"):
+            par_jour[jour] = groupe
+
+    premier = dt.date(annee, mois, 1)
+    dernier = dt.date(annee + (mois == 12), mois % 12 + 1, 1) - dt.timedelta(days=1)
+    debut = premier - dt.timedelta(days=premier.weekday())      # lundi de la 1re semaine
+
+    st.markdown(
+        "<div style='display:grid;grid-template-columns:repeat(7,1fr);gap:4px;"
+        "text-align:center;font-size:0.7rem;color:#7a8c85;text-transform:uppercase;"
+        "letter-spacing:.4px;margin-bottom:4px'>"
+        + "".join("<div>" + j + "</div>" for j in JOURS_SEMAINE) + "</div>",
+        unsafe_allow_html=True,
+    )
+
+    cases = []
+    jour = debut
+    while jour <= dernier or jour.weekday() != 0:
+        groupe = par_jour.get(jour)
+        n = 0 if groupe is None else len(groupe)
+        hors = not (premier <= jour <= dernier)
+        classes = "cal-case " + _classe_charge(n, jour)
+        if hors:
+            classes += " hors"
+        if jour == aujourdhui:
+            classes += " aujourdhui"
+        cases.append(
+            "<div class='" + classes + "'>"
+            "<div class='d'>" + str(jour.day) + "</div>"
+            "<div class='n'>" + (str(n) if n else "&nbsp;") + "</div>"
+            "<div>" + (_pastilles(groupe) if groupe is not None else "") + "</div></div>"
+        )
+        jour += dt.timedelta(days=1)
+        if len(cases) > 42:
+            break
+
+    st.markdown(
+        "<div style='display:grid;grid-template-columns:repeat(7,1fr);gap:4px'>"
+        + "".join(cases) + "</div>",
+        unsafe_allow_html=True,
+    )
+
+    legende = "  ·  ".join(
+        "<span class='cal-pastille' style='background:" + PROFILS[nom]["couleur"] + "'></span> " + nom
+        for nom in COMMERCIALES
+    )
+    st.markdown(
+        "<div style='font-size:0.76rem;color:#5a6b64;margin-top:10px'>" + legende +
+        "  ·  Une case rouge signale des rappels dont la date est dépassée.</div>",
+        unsafe_allow_html=True,
+    )
+
+    du_mois = rappels[(rappels["date_rappel"] >= premier) & (rappels["date_rappel"] <= dernier)] \
+        if not rappels.empty else rappels
+    if not du_mois.empty:
+        st.caption(str(len(du_mois)) + " rappel(s) programmé(s) sur le mois affiché.")
+    else:
+        st.caption("Aucun rappel programmé sur ce mois.")
+
+
 def stats_utilisateur(suivi_df: pd.DataFrame, suivi_adr: pd.DataFrame, nom: str) -> dict:
     """Indicateurs d'activité d'une commerciale."""
     aujourdhui = dt.date.today()
@@ -1244,6 +1438,9 @@ stats = {nom: stats_utilisateur(suivi, suivi_adr, nom) for nom in COMMERCIALES}
 PEUT_TRAITER_TMP = ROLE in ("commercial", "admin")
 mes_rappels = rappels_dus(base, UTILISATEUR) if PEUT_TRAITER_TMP else pd.DataFrame()
 tous_rappels = rappels_dus(base)
+# Rappels programmés, passés comme à venir : matière du calendrier.
+mon_calendrier = rappels_planifies(base, UTILISATEUR) if PEUT_TRAITER_TMP else pd.DataFrame()
+calendrier_equipe = rappels_planifies(base)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1275,7 +1472,7 @@ with st.sidebar:
         st.rerun()
     if sc2.button("🚪 Déconnexion", use_container_width=True):
         for cle in ("utilisateur", "role", "idx", "idx_adr", "demo_active",
-                    "demo_etape", "saut_code"):
+                    "demo_etape", "saut_code", "jour_rappel", "cal_decalage"):
             st.session_state.pop(cle, None)
         st.rerun()
 
@@ -1450,6 +1647,9 @@ code_saut = st.session_state.get("saut_code", "")
 code_cible = str(code_direct).strip() or code_saut
 acces_direct = bool(code_cible)
 
+# Un jour choisi dans le calendrier remplace la file par les rappels de ce jour.
+jour_choisi = st.session_state.get("jour_rappel", "")
+
 if acces_direct:
     cible = str(code_cible).strip().upper()
     direct = base[base[col_code].astype(str).str.upper() == cible]
@@ -1460,6 +1660,20 @@ if acces_direct:
     else:
         file_appel = direct.reset_index(drop=True)
         st.session_state.idx = 0
+
+if not acces_direct and jour_choisi and PEUT_TRAITER:
+    source = mon_calendrier
+    if jour_choisi == "retard":
+        selection = source[source["date_rappel"] < dt.date.today()] if not source.empty else source
+    else:
+        cible_jour = dt.date.fromisoformat(jour_choisi)
+        selection = source[source["date_rappel"] == cible_jour] if not source.empty else source
+    if selection.empty:
+        st.session_state.pop("jour_rappel", None)
+        jour_choisi = ""
+    else:
+        file_appel = selection.drop(columns=["date_rappel"]).reset_index(drop=True)
+        acces_direct = True   # les autres filtres ne s'appliquent pas
 
 if not acces_direct and PEUT_TRAITER:
     if f_traitement:
@@ -1520,6 +1734,21 @@ if PEUT_PILOTER:
 # ── ONGLETS DE TRAVAIL (commerciales et administrateur) ──────────────────────
 if PEUT_TRAITER:
     with onglet_appel:
+        # Calendrier de la semaine, replié par défaut pour ne pas repousser
+        # la fiche hors de l'écran.
+        with st.expander("🗓️ Mes rappels des sept prochains jours",
+                         expanded=not st.session_state.get("jour_rappel")):
+            bande_sept_jours(mon_calendrier, "bande")
+
+        if st.session_state.get("jour_rappel"):
+            libelle = ("rappels en retard" if st.session_state.jour_rappel == "retard"
+                       else "rappels du " + jolie_date(st.session_state.jour_rappel))
+            st.info("File filtrée sur les " + libelle + " — " + str(len(file_appel)) + " fiche(s).")
+            if st.button("↩︎ Revenir à ma file d'appel", key="retour_jour"):
+                st.session_state.pop("jour_rappel", None)
+                st.session_state.pop("idx", None)
+                st.rerun()
+
         if st.session_state.get("saut_code"):
             if st.button("↩︎ Revenir à ma file d'appel"):
                 st.session_state.pop("saut_code", None)
@@ -2100,6 +2329,13 @@ if PEUT_PILOTER:
                                      "rappel_date": "À rappeler le", "note": "Notes"}),
                     hide_index=True, use_container_width=True,
                 )
+
+        # ── Calendrier des rappels ──────────────────────────────────────────
+        st.divider()
+        st.subheader("🗓️ Calendrier des rappels")
+        st.caption("Alimenté par les dates que les commerciales inscrivent dans les fiches. "
+                   "C'est la charge à venir, que les autres écrans ne montrent pas.")
+        grille_mensuelle(calendrier_equipe, "grille")
 
         # ── Journal des interventions manuelles ─────────────────────────────
         journal = charger_journal()

@@ -1070,11 +1070,16 @@ def bande_sept_jours(rappels: pd.DataFrame, prefixe: str) -> None:
             st.rerun()
 
 
-def grille_mensuelle(rappels: pd.DataFrame, prefixe: str) -> None:
+def grille_mensuelle(rappels: pd.DataFrame, prefixe: str, col_code: str = "Code client") -> None:
     """Grille d'un mois entier, pour le pilotage.
 
     Une case par jour : le nombre de rappels, et une pastille par commerciale
-    concernée. C'est la charge à venir, que rien d'autre dans l'outil ne montre.
+    concernée. Sous la grille, un bouton par journée concernée ouvre la liste
+    des clients à rappeler — une couleur montre la charge, seule la liste
+    permet de décrocher le téléphone.
+
+    `col_code` est le nom de la colonne du code client dans le fichier chargé :
+    il varie d'un fichier à l'autre, d'où le passage en paramètre.
     """
     if "cal_decalage" not in st.session_state:
         st.session_state.cal_decalage = 0

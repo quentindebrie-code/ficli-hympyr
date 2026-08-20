@@ -917,41 +917,47 @@ def deviner_typologie(fiche: Mapping[str, Any] | None) -> Detection:
     """
     Déduit la typologie d'appel depuis une ligne du fichier clients.
 
-    Tolérant aux noms de colonnes : on cherche par mots-clés, pas par nom exact.
-    La détection n'est qu'une pré-sélection — l'utilisateur change d'onglet d'un
-    clic si elle se trompe, sans rerun.
+    Tolérant aux noms de colonnes : on cherche par mots-clés, pas par nom exact,
+    de manière à fonctionner avec « Type client », « Catégorie normalisée »,
+    « Raison sociale / Nom », « SIREN » aussi bien qu'avec d'autres intitulés.
+
+    La détection n'est qu'une pré-sélection : l'utilisateur change d'onglet d'un
+    clic si elle se trompe, sans rerun et sans perdre sa saisie.
     """
     if not fiche:
         return Detection("particulier", "", "aucune donnée fiche : onglet par défaut", "faible")
 
-    fiche = {k: v for k, v in dict(fiche).items()}
+    fiche = dict(fiche)
 
-    # -- 1. Colonne de type explicite : la source la plus fiable ------------
-    for brut in _valeurs(fiche, _CLES_TYPE):
+    valeurs_type = _valeurs(fiche, _CLES_TYPE)
+    noms = _valeurs(fiche, _CLES_NOM)
+    naf = " ".join(_valeurs(fiche, _CLES_NAF))
+    # Le sous-type (TP / transport / agriculture) se cherche partout : une colonne
+    # « Catégorie » vaut souvent mieux que la raison sociale pour ça.
+    blob = " " + _sans_accents(" ".join(noms + valeurs_type + [naf])) + " "
+
+    def _resultat_pro(motif: str, confiance: str) -> Detection:
+        sous, motif_sous = _sous_type_pro(blob, naf)
+        return Detection("pro", sous, motif + (f" · {motif_sous}" if motif_sous else ""), confiance)
+
+    # -- 1. Colonne de type explicite : la source la plus fiable ---------------
+    for brut in valeurs_type:
         v = _sans_accents(brut)
         if any(m in v for m in ("collectiv", "mairie", "public", "administration", "commune")):
             return Detection("collectivite", "", f"colonne de type : « {brut} »", "forte")
-        if any(m in v for m in ("particulier", "prive", "menage", "domestique")):
+        if any(m in v for m in ("particulier", "prive", "menage", "domestique", "monsieur", "madame")):
             return Detection("particulier", "", f"colonne de type : « {brut} »", "forte")
-        if any(m in v for m in ("pro", "entreprise", "societe", "agri", "tp", "transport", "btp")):
-            naf = " ".join(_valeurs(fiche, _CLES_NAF))
-            blob = _sans_accents(" ".join(_valeurs(fiche, _CLES_NOM) + [brut, naf]))
-            sous, motif_sous = _sous_type_pro(blob, naf)
-            motif = f"colonne de type : « {brut} »"
-            if motif_sous:
-                motif += f" · {motif_sous}"
-            return Detection("pro", sous, motif, "forte")
+        if any(m in v for m in ("pro", "entreprise", "societe", "agri", "tp", "transport",
+                                "btp", "asso", "artisan", "commerc")):
+            # « Pro (déduit) » reste une déduction du fichier : on le signale.
+            confiance = "moyenne" if "deduit" in v else "forte"
+            return _resultat_pro(f"colonne de type : « {brut} »", confiance)
 
-    noms = _valeurs(fiche, _CLES_NOM)
-    naf = " ".join(_valeurs(fiche, _CLES_NAF))
-    blob = _sans_accents(" ".join(noms + [naf]))
-    blob = f" {blob} "
-
-    # -- 2. Marqueurs d'entité publique dans la raison sociale ---------------
+    # -- 2. Marqueurs d'entité publique dans la raison sociale ----------------
     if any(mot in blob for mot in _MOTS_PUBLIC):
         return Detection("collectivite", "", "raison sociale de type entité publique", "forte")
 
-    # -- 3. SIREN / SIRET ----------------------------------------------------
+    # -- 3. SIREN / SIRET -----------------------------------------------------
     for brut in _valeurs(fiche, _CLES_SIRET):
         chiffres = re.sub(r"[^0-9]", "", brut)
         if len(chiffres) in (9, 14):
@@ -963,21 +969,13 @@ def deviner_typologie(fiche: Mapping[str, Any] | None) -> Detection:
                     "collectivite", "",
                     f"SIREN commençant par {chiffres[0]} (organisme public)", "moyenne",
                 )
-            sous, motif_sous = _sous_type_pro(blob, naf)
-            motif = "SIREN/SIRET renseigné"
-            if motif_sous:
-                motif += f" · {motif_sous}"
-            return Detection("pro", sous, motif, "forte")
+            return _resultat_pro("SIREN/SIRET renseigné", "forte")
 
-    # -- 4. Forme juridique dans la raison sociale ---------------------------
+    # -- 4. Forme juridique dans la raison sociale ----------------------------
     if any(mot in blob for mot in _MOTS_SOCIETE):
-        sous, motif_sous = _sous_type_pro(blob, naf)
-        motif = "forme juridique détectée dans la raison sociale"
-        if motif_sous:
-            motif += f" · {motif_sous}"
-        return Detection("pro", sous, motif, "moyenne")
+        return _resultat_pro("forme juridique détectée dans la raison sociale", "moyenne")
 
-    # -- 5. Par défaut : particulier -----------------------------------------
+    # -- 5. Par défaut : particulier ------------------------------------------
     return Detection(
         "particulier", "",
         "aucun marqueur professionnel ni public trouvé", "faible",

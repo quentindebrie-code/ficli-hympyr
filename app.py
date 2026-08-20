@@ -54,6 +54,10 @@ from typing import Iterable
 import pandas as pd
 import streamlit as st
 
+# Scripts d'appel et objections par typologie (fichier script.py, même dossier).
+# Le module est autonome : il ne touche ni à la base, ni à st.session_state.
+import script as scripts_appel
+
 # ─────────────────────────────────────────────────────────────────────────────
 # CONFIGURATION
 # ─────────────────────────────────────────────────────────────────────────────
@@ -275,6 +279,22 @@ def trouver_colonne(colonnes: Iterable, *cibles: str):
         if cible in norm:
             return norm[cible]
     return None
+
+
+def produit_principal(ligne) -> str:
+    """Produit à injecter dans les phrases du script d'appel.
+
+    On prend le premier produit déjà enregistré sur la fiche. Tant que l'appel
+    n'a pas eu lieu, il n'y en a pas : le script affiche alors « [produit] »,
+    ce qui est honnête plutôt que d'inventer une énergie que le client
+    n'achetait peut-être pas.
+    """
+    brut = str(ligne.get("produits") or "")
+    for morceau in brut.split("|"):
+        morceau = morceau.strip()
+        if morceau:
+            return morceau
+    return ""
 
 
 def pastille_traitement(traite_par: str) -> str:
@@ -1409,6 +1429,15 @@ DEMO_COMMERCIAL = [
      "Une <b>pastille colorée</b> en haut indique qui a déjà traité la fiche — grise si personne. "
      "Si votre collègue est en train de la consulter, un <b>bandeau orange</b> vous prévient : "
      "passez simplement à la suivante."),
+    ("Le script d'appel, sur la fiche",
+     "Au-dessus de la fiche, l'interrupteur <b>« Script d'appel et objections »</b> ouvre un "
+     "panneau en deux colonnes : à gauche le <b>déroulé de l'appel</b> étape par étape, à droite "
+     "les <b>objections</b> avec la réponse à apporter. L'outil choisit automatiquement le bon "
+     "script — particulier, professionnel ou collectivité — mais les trois onglets restent "
+     "cliquables si la déduction se trompe.<br><br>"
+     "Pendant l'appel, tapez un mot dans la case de recherche (<b>prix</b>, <b>temps</b>, "
+     "<b>marché</b>, <b>SIREN</b>…) : la bonne réponse s'ouvre toute seule. "
+     "Rien de ce que vous faites dans ce panneau ne recharge la page ni n'efface votre saisie."),
     ("Onglet « Points de livraison » : le prolongement de l'appel",
      "Une entreprise cliente peut avoir plusieurs sites livrés. Sur la fiche client, un bloc "
      "<b>« adresses de livraison rattachées »</b> vous les montre. "
@@ -1416,7 +1445,8 @@ DEMO_COMMERCIAL = [
      "cet onglet — la recherche par <b>code client mère</b> affiche tous les points d'un même client."),
     ("Le déroulé d'un appel, en cinq gestes",
      "1. Filtre <b>Non traité</b> dans la colonne de gauche.<br>"
-     "2. Vous appelez le client affiché.<br>"
+     "2. Vous ouvrez le <b>script d'appel</b> si vous en avez besoin, puis vous appelez "
+     "le client affiché.<br>"
      "3. Vous remplissez le formulaire de droite : statut, produits, e-mail et téléphone confirmés.<br>"
      "4. Vous cliquez sur <b>Enregistrer & passer au suivant</b> — la fiche suivante s'ouvre seule.<br>"
      "5. Si le client a plusieurs sites, vous complétez l'onglet <b>Points de livraison</b>."),
@@ -1465,6 +1495,15 @@ DEMO_ADMIN = [
      "il permet de <b>réattribuer</b> une fiche à quelqu'un d'autre, de la <b>rendre à la file</b> "
      "en la repassant à « non traité », ou de <b>forcer un statut</b>. "
      "Chaque intervention est inscrite au journal, consultable depuis le tableau de bord."),
+    ("Le script d'appel, sur la fiche",
+     "Au-dessus de la fiche, l'interrupteur <b>« Script d'appel et objections »</b> ouvre un "
+     "panneau en deux colonnes : à gauche le <b>déroulé de l'appel</b> étape par étape, à droite "
+     "les <b>objections</b> avec la réponse à apporter. L'outil choisit automatiquement le bon "
+     "script — particulier, professionnel ou collectivité — mais les trois onglets restent "
+     "cliquables si la déduction se trompe.<br><br>"
+     "Pendant l'appel, tapez un mot dans la case de recherche (<b>prix</b>, <b>temps</b>, "
+     "<b>marché</b>, <b>SIREN</b>…) : la bonne réponse s'ouvre toute seule. "
+     "Rien de ce que vous faites dans ce panneau ne recharge la page ni n'efface votre saisie."),
     ("Onglet « Tableau de bord » : la vue de pilotage",
      "Objectif quotidien face au rythme réel, performance comparée des deux commerciales, "
      "avancement global et rappels en retard. Vos propres fiches sont comptées dans l'avancement "
@@ -2017,6 +2056,32 @@ if PEUT_TRAITER:
                     f"{'à l’instant' if minutes < 1 else f'depuis {minutes} min'}. "
                     f"Pour éviter d'appeler deux fois le même client, passez à la suivante.</div>",
                     unsafe_allow_html=True,
+                )
+
+            # ── Script d'appel et objections ─────────────────────────────
+            # La typologie est déduite de la fiche puis pré-sélectionnée ; les
+            # trois onglets restent cliquables si la déduction se trompe.
+            # Le panneau est un composant HTML isolé : changer d'onglet,
+            # chercher une objection ou en déplier une ne relance PAS le script
+            # Streamlit, donc ne peut pas perturber la saisie en cours.
+            detection = scripts_appel.deviner_typologie(ligne.to_dict())
+            st.toggle(
+                "📞 Script d'appel et objections",
+                key="afficher_script",
+                help="Le panneau reste dans l'état choisi d'une fiche à l'autre. "
+                     "Typologie déduite : " + detection.motif,
+            )
+            if st.session_state.get("afficher_script"):
+                scripts_appel.panneau_scripts(
+                    typologie=detection.typologie,
+                    sous_type=detection.sous_type,
+                    contexte=scripts_appel.Contexte(
+                        client=str(ligne.get("Raison sociale / Nom", "") or ""),
+                        appelant=UTILISATEUR,
+                        produit=produit_principal(ligne),
+                    ),
+                    motif_detection=detection.motif,
+                    hauteur=620,
                 )
 
             gauche, droite = st.columns([3, 2])

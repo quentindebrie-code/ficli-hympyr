@@ -1337,29 +1337,113 @@ def _theme_actif() -> str:
 # 5. POINTS D'ENTRÉE
 # ═══════════════════════════════════════════════════════════════════════════
 
+# ── Rendu natif, sans composant HTML ────────────────────────────────────────
+# Mode de repli : n'utilise que des éléments Streamlit standard. Les onglets et
+# les expandeurs sont gérés côté navigateur, il n'y a donc toujours aucun rerun
+# lors de la consultation. On perd la recherche plein texte et la mise en page
+# en colonnes serrées ; on gagne l'absence totale d'iframe.
+
+def _texte_natif(morceaux: Sequence[str], jetons: Mapping[str, str]) -> str:
+    rendu = []
+    for m in morceaux:
+        for cle, valeur in jetons.items():
+            m = m.replace("{" + cle + "}", valeur)
+        rendu.append(m)
+    return rendu
+
+
+def _panneau_natif(typologie: str, sous_type: str, contexte: Contexte) -> None:
+    jetons = contexte.jetons()
+    # La typologie déduite passe en premier : l'onglet actif par défaut dans
+    # st.tabs est toujours le premier, c'est ce qui la pré-sélectionne.
+    ordre = [typologie] + [c for c in ORDRE_ONGLETS if c != typologie]
+    onglets = st.tabs([SCRIPTS[c].libelle for c in ordre])
+
+    for onglet, cle in zip(onglets, ordre):
+        script = SCRIPTS[cle]
+        with onglet:
+            st.info("  \n".join("• " + t for t in _texte_natif(script.regles_or, jetons)))
+            col_g, col_d = st.columns([1.15, 0.85])
+
+            with col_g:
+                st.markdown("**Déroulé de l'appel**")
+                for etape in script.etapes:
+                    st.markdown(f"**{etape.numero}. {etape.titre}**")
+                    for phrase in _texte_natif(etape.dire, jetons):
+                        st.markdown(f"> « {phrase} »")
+                    for relance in _texte_natif(etape.relances, jetons):
+                        st.markdown(f"- {relance}")
+                    if etape.branches:
+                        labels = [b.label for b in etape.branches]
+                        actif = _index_preselection(etape, sous_type)
+                        labels = labels[actif:] + labels[:actif]
+                        branches = list(etape.branches[actif:]) + list(etape.branches[:actif])
+                        for sous_onglet, branche in zip(st.tabs(labels), branches):
+                            with sous_onglet:
+                                for phrase in _texte_natif(branche.dire, jetons):
+                                    st.markdown(f"> « {phrase} »")
+                                for relance in _texte_natif(branche.relances, jetons):
+                                    st.markdown(f"- {relance}")
+                                if branche.note:
+                                    st.caption("⚑ " + _texte_natif([branche.note], jetons)[0])
+                    if etape.note:
+                        st.caption("⚑ " + _texte_natif([etape.note], jetons)[0])
+                    st.divider()
+                st.markdown("**À consigner avant de raccrocher**")
+                for item in _texte_natif(script.a_consigner, jetons):
+                    st.markdown(f"- {item}")
+
+            with col_d:
+                st.markdown("**Objections — réponses types**")
+                for objection in script.objections:
+                    with st.expander(_texte_natif([objection.intitule], jetons)[0]):
+                        for phrase in _texte_natif(objection.dire, jetons):
+                            st.markdown(f"> « {phrase} »")
+                        for relance in _texte_natif(objection.puis, jetons):
+                            st.markdown(f"- {relance}")
+                        if objection.conduite:
+                            st.caption("⚑ " + _texte_natif([objection.conduite], jetons)[0])
+                        if objection.alerte:
+                            st.warning(_texte_natif([objection.alerte], jetons)[0])
+
+
 def panneau_scripts(
     typologie: str = "particulier",
     sous_type: str = "",
     contexte: Contexte | None = None,
     motif_detection: str = "",
-    hauteur: int = 720,
+    hauteur: int = 620,
+    mode: str = "html",
 ) -> None:
     """
     Affiche le panneau scripts + objections.
 
-    Ne crée aucun widget Streamlit : aucun rerun n'est déclenché par les
-    interactions internes (onglets, recherche, accordéons).
+    mode="html"  : composant HTML isolé — recherche plein texte, mise en page en
+                   deux colonnes, aucun rerun.
+    mode="natif" : uniquement des éléments Streamlit (onglets et expandeurs).
+                   Pas de recherche, mais aucune iframe. À utiliser si le
+                   composant pose problème sur la plateforme d'hébergement.
+
+    Aucun des deux modes ne déclenche de rerun à la consultation. Toute erreur
+    de rendu est affichée à l'écran plutôt que de laisser la page inachevée.
     """
     if typologie not in SCRIPTS:
         typologie = "particulier"
-    html_doc = _construire_html(
-        typologie=typologie,
-        sous_type=sous_type,
-        contexte=contexte or Contexte(),
-        motif_detection=motif_detection,
-        theme=_theme_actif(),
-    )
-    components.html(html_doc, height=hauteur, scrolling=False)
+    contexte = contexte or Contexte()
+    try:
+        if mode == "natif":
+            _panneau_natif(typologie, sous_type, contexte)
+            return
+        html_doc = _construire_html(
+            typologie=typologie,
+            sous_type=sous_type,
+            contexte=contexte,
+            motif_detection=motif_detection,
+            theme=_theme_actif(),
+        )
+        components.html(html_doc, height=hauteur, scrolling=False)
+    except Exception as exc:  # le script d'appel ne doit jamais bloquer l'outil
+        st.error(f"Le panneau de script n'a pas pu s'afficher : {exc}")
 
 
 def dialogue_scripts(

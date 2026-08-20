@@ -146,6 +146,14 @@ DEADLINE = dt.date(2027, 9, 1)
 # Durée pendant laquelle un verrou de consultation reste considéré comme actif.
 VERROU_MINUTES = 12
 
+# Rendu du panneau de script d'appel.
+#   "html"  : composant isolé, avec recherche plein texte (par défaut).
+#   "natif" : uniquement des éléments Streamlit, sans iframe.
+#   ""      : fonctionnalité désactivée, l'outil revient à son état antérieur.
+# En cas de comportement anormal, basculer sur "natif" puis sur "" : c'est le
+# moyen le plus rapide de savoir si le panneau est en cause.
+MODE_SCRIPT_APPEL = "html"
+
 # Libellés d'affichage utilisés dans les exports pour une valeur vide.
 # À l'import, ils doivent redevenir une chaîne vide.
 LIBELLES_VIDES = {"Non traité", "Non traitée", "Non vérifié", "Non vérifiée", "—", "-"}
@@ -2065,13 +2073,14 @@ if PEUT_TRAITER:
             # chercher une objection ou en déplier une ne relance PAS le script
             # Streamlit, donc ne peut pas perturber la saisie en cours.
             detection = scripts_appel.deviner_typologie(ligne.to_dict())
-            st.toggle(
-                "📞 Script d'appel et objections",
-                key="afficher_script",
-                help="Le panneau reste dans l'état choisi d'une fiche à l'autre. "
-                     "Typologie déduite : " + detection.motif,
-            )
-            if st.session_state.get("afficher_script"):
+            if MODE_SCRIPT_APPEL:
+                st.toggle(
+                    "📞 Script d'appel et objections",
+                    key="afficher_script",
+                    help="Le panneau reste dans l'état choisi d'une fiche à l'autre. "
+                         "Typologie déduite : " + detection.motif,
+                )
+            if MODE_SCRIPT_APPEL and st.session_state.get("afficher_script"):
                 scripts_appel.panneau_scripts(
                     typologie=detection.typologie,
                     sous_type=detection.sous_type,
@@ -2082,6 +2091,7 @@ if PEUT_TRAITER:
                     ),
                     motif_detection=detection.motif,
                     hauteur=620,
+                    mode=MODE_SCRIPT_APPEL,
                 )
 
             gauche, droite = st.columns([3, 2])

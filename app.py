@@ -118,7 +118,7 @@ PRODUITS = [
 ]
 
 STATUTS = [
-    "À appeler", "À rappeler", "Injoignable",
+    "À appeler", "À rappeler", "Injoignable", "Boudret",
     "Fait ✅", "Doublon", "Ancien client (à sortir)",
 ]
 STATUTS_TERMINES = {"Fait ✅", "Doublon", "Ancien client (à sortir)"}

@@ -99,7 +99,7 @@ PROFILS = {
         "role": "admin",
         "couleur": BLEU,
         # Mot de passe provisoire : QDEadmin8131@!!  — à changer, voir empreinte().
-        "empreinte": "Lisacone8131@",
+        "empreinte": "c6d1892f279428bcd9e60975e74de88fef32ba28c6d080d5475640d60e5c10cc",
     },
 }
 

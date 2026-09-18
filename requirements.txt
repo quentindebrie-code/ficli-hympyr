@@ -5,3 +5,4 @@ openpyxl==3.1.5
 # Streamlit Cloud conserve `psycopg` sans son implémentation binaire.
 psycopg==3.3.5
 psycopg-binary==3.3.5
+psycopg-pool==3.3.1

@@ -1,0 +1,6 @@
+__pycache__/
+*.py[cod]
+.streamlit/secrets.toml
+suivi_appels.db*
+sauvegardes/
+.pytest_cache/

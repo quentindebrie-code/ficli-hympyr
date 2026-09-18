@@ -61,6 +61,11 @@ try:
 except ImportError:  # Le mode SQLite local reste utilisable sans PostgreSQL.
     psycopg = None
 
+try:
+    from psycopg_pool import ConnectionPool
+except ImportError:  # Le mode SQLite local reste utilisable sans le pool.
+    ConnectionPool = None
+
 # Scripts d'appel et objections par typologie (fichier script.py, même dossier).
 # Le module est autonome : il ne touche ni à la base, ni à st.session_state.
 import script as scripts_appel
@@ -348,6 +353,28 @@ def pastille_traitement(traite_par: str) -> str:
 # BASE DE SUIVI (SQLite)
 # ─────────────────────────────────────────────────────────────────────────────
 
+@st.cache_resource(show_spinner=False)
+def pool_postgresql():
+    """Conserve les connexions réseau au lieu d'en recréer à chaque clic."""
+    if not BASE_DISTANTE:
+        return None
+    if psycopg is None or ConnectionPool is None:
+        raise RuntimeError(
+            "La base PostgreSQL est configurée mais son pilote ou son pool n'est pas installé."
+        )
+    return ConnectionPool(
+        conninfo=DATABASE_URL,
+        min_size=1,
+        max_size=6,
+        timeout=8,
+        max_idle=300,
+        max_lifetime=1800,
+        reconnect_timeout=8,
+        kwargs={"connect_timeout": 8},
+        open=True,
+    )
+
+
 @contextmanager
 def connexion():
     """Connexion transactionnelle à PostgreSQL, ou SQLite en développement.
@@ -356,19 +383,19 @@ def connexion():
     ne constitue pas une sauvegarde durable. Une courte reprise automatique
     absorbe les micro-coupures réseau sans faire échouer toute l'application.
     """
+    if BASE_DISTANTE:
+        # Le contexte du pool valide la transaction puis rend la connexion
+        # disponible pour le prochain rerun ou une autre utilisatrice.
+        with pool_postgresql().connection(timeout=8) as con:
+            yield con
+        return
+
     con = None
     derniere_erreur = None
     for tentative in range(3):
         try:
-            if BASE_DISTANTE:
-                if psycopg is None:
-                    raise RuntimeError(
-                        "HYMPYR_DATABASE_URL est défini mais psycopg n'est pas installé."
-                    )
-                con = psycopg.connect(DATABASE_URL, connect_timeout=8)
-            else:
-                con = sqlite3.connect(DB_PATH, timeout=30, check_same_thread=False)
-                con.execute("PRAGMA busy_timeout=30000")
+            con = sqlite3.connect(DB_PATH, timeout=30, check_same_thread=False)
+            con.execute("PRAGMA busy_timeout=30000")
             break
         except Exception as exc:
             derniere_erreur = exc
@@ -417,7 +444,8 @@ def colonnes_table(con, table: str) -> list[str]:
     return [r[1] for r in executer(con, f"PRAGMA table_info({table})").fetchall()]
 
 
-def initialiser_base() -> None:
+@st.cache_resource(show_spinner=False)
+def initialiser_base() -> bool:
     if not BASE_DISTANTE:
         # Réglages persistants du fichier SQLite : posés une seule fois.
         con = sqlite3.connect(DB_PATH, timeout=30, check_same_thread=False)
@@ -518,6 +546,7 @@ def initialiser_base() -> None:
         executer(con, "CREATE INDEX IF NOT EXISTS idx_appels_jour ON appels(jour, utilisateur)")
         executer(con, "CREATE INDEX IF NOT EXISTS idx_historique_cible "
                       "ON historique(type_fiche, code, horodatage)")
+    return True
 
 
 initialiser_base()
@@ -668,8 +697,9 @@ def enregistrer_adresse(code_adresse: str, utilisateur: str,
 
 
 def nb_modifs_depuis_export() -> int:
-    ref = lire_meta("dernier_export", "1970-01-01T00:00:00")
     with connexion() as con:
+        ligne = executer(con, "SELECT valeur FROM meta WHERE cle=?", ("dernier_export",)).fetchone()
+        ref = ligne[0] if ligne else "1970-01-01T00:00:00"
         n = executer(con, "SELECT COUNT(*) FROM suivi WHERE maj_le > ?", (ref,)).fetchone()[0]
         n += executer(con, "SELECT COUNT(*) FROM suivi_adresses WHERE maj_le > ?", (ref,)).fetchone()[0]
     return int(n)

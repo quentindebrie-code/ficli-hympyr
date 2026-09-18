@@ -1718,6 +1718,11 @@ def afficher_demo(role: str) -> None:
 
 coffre = coffre_fichier()
 
+
+def confirmer_reprise_base() -> None:
+    """Valide la reprise avant le rerun déclenché par le bouton Streamlit."""
+    coffre["restaure"] = True
+
 # Après un redémarrage du conteneur, le classeur revient depuis la même base
 # durable que les suivis : aucune intervention ni nouvel export n'est requis.
 if coffre["contenu"] is None:
@@ -1764,7 +1769,16 @@ def ecran_connexion() -> None:
             )
 
         pret = (f_mere is not None or deja_charge) and (reprendre or (f_suivi is not None and f_refs is not None))
-        if st.button("Ouvrir la session", type="primary", disabled=not pret):
+        ouvrir = st.button(
+            "Ouvrir la session",
+            type="primary",
+            disabled=not pret,
+            # Le callback s'exécute avant l'unique rerun du bouton : le script
+            # arrive donc directement à l'écran de connexion, sans second
+            # rechargement ni vidage global des caches.
+            on_click=confirmer_reprise_base if reprendre else None,
+        )
+        if ouvrir and not reprendre:
             try:
                 if f_mere is not None:
                     coffre["contenu"] = f_mere.getvalue()
@@ -1774,15 +1788,14 @@ def ecran_connexion() -> None:
                     enregistrer_fichier_maitre(
                         coffre["nom"], coffre["contenu"]
                     )
-                messages = []
-                if not reprendre:
-                    messages.append(f"{importer_suivi_clients_csv(f_suivi)} fiches clients restaurées")
-                    messages.append(f"{importer_suivi_adresses_csv(f_refs)} référents restaurés")
-                    ecrire_meta("dernier_export", maintenant_iso())
+                messages = [
+                    f"{importer_suivi_clients_csv(f_suivi)} fiches clients restaurées",
+                    f"{importer_suivi_adresses_csv(f_refs)} référents restaurés",
+                ]
+                ecrire_meta("dernier_export", maintenant_iso())
                 coffre["restaure"] = True
                 st.cache_data.clear()
-                if messages:
-                    st.success("✅ " + " · ".join(messages))
+                st.success("✅ " + " · ".join(messages))
                 st.rerun()
             except Exception as exc:
                 st.error(f"Chargement impossible : {exc}")

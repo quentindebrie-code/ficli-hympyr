@@ -1752,11 +1752,13 @@ def ecran_connexion() -> None:
         # Échappatoire si la base contient déjà le travail : demander les deux
         # sauvegardes serait alors un risque de régression, pas une sécurité.
         reprendre = False
-        if not base_est_vide():
+        base_non_vide = not base_est_vide()
+        if base_non_vide:
             with connexion() as con:
                 nb = executer(con, "SELECT COUNT(*) FROM suivi").fetchone()[0]
             reprendre = st.checkbox(
                 f"La base contient déjà {formater_entier(nb)} fiche(s) — reprendre sans restaurer les sauvegardes",
+                key="reprendre_base_existante",
                 help="À cocher uniquement si le travail en cours est déjà dans l'outil. "
                      "Restaurer une sauvegarde plus ancienne écraserait les saisies récentes.",
             )
@@ -1785,7 +1787,12 @@ def ecran_connexion() -> None:
             except Exception as exc:
                 st.error(f"Chargement impossible : {exc}")
         if not pret:
-            st.info("Charge les trois fichiers pour continuer.")
+            if deja_charge and base_non_vide:
+                st.info(
+                    "Coche « reprendre sans restaurer les sauvegardes », puis ouvre la session."
+                )
+            else:
+                st.info("Charge les trois fichiers pour continuer.")
         st.stop()
 
     # ── Étape 2 : profil et mot de passe ─────────────────────────────────────
@@ -1811,6 +1818,7 @@ def ecran_connexion() -> None:
             coffre["contenu"] = None
             coffre["restaure"] = False
             coffre["clients"] = None
+            st.session_state.pop("reprendre_base_existante", None)
             st.cache_data.clear()
             st.rerun()
     st.stop()

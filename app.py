@@ -101,6 +101,7 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s %(message)s",
 )
 LOGGER = logging.getLogger("hympyr.cockpit")
+DEBUT_RENDU = time.perf_counter()
 
 VERT, VERT_FONCE, ORANGE, GRIS = "#1A6B45", "#0D3D27", "#FF5C29", "#8E9A94"
 BLEU = "#2F5D8C"   # profil administrateur
@@ -608,6 +609,68 @@ def charger_suivi_adresses() -> pd.DataFrame:
     return lire_tableau("SELECT * FROM suivi_adresses")
 
 
+@st.cache_data(ttl=30, show_spinner=False)
+def charger_etat_courant() -> tuple[pd.DataFrame, pd.DataFrame, int, dict]:
+    """Charge en bloc les données communes à chaque affichage.
+
+    Streamlit réexécute le script à chaque clic. Sans cet instantané très court,
+    un changement de filtre ou d'onglet relisait les mêmes tables et recomptait
+    plusieurs fois les appels du jour sur le réseau. Les écritures invalident le
+    cache immédiatement ; les autres sessions voient au pire un état vieux de
+    trente secondes si l'application tourne exceptionnellement sur plusieurs
+    processus. Dans le fonctionnement normal, une écriture invalide l'instantané
+    pour tout le monde immédiatement.
+    """
+    debut = time.perf_counter()
+    with connexion() as con:
+        curseur = executer(con, "SELECT * FROM suivi")
+        lignes = curseur.fetchall()
+        colonnes = [description[0] for description in curseur.description]
+        suivi = pd.DataFrame(lignes, columns=colonnes).fillna("")
+
+        curseur = executer(con, "SELECT * FROM suivi_adresses")
+        lignes = curseur.fetchall()
+        colonnes = [description[0] for description in curseur.description]
+        suivi_adresses = pd.DataFrame(lignes, columns=colonnes).fillna("")
+
+        ref_ligne = executer(
+            con, "SELECT valeur FROM meta WHERE cle=?", ("dernier_export",)
+        ).fetchone()
+        ref = ref_ligne[0] if ref_ligne else "1970-01-01T00:00:00"
+        modifs = executer(
+            con,
+            "SELECT "
+            "(SELECT COUNT(*) FROM suivi WHERE maj_le > ?) + "
+            "(SELECT COUNT(*) FROM suivi_adresses WHERE maj_le > ?)",
+            (ref, ref),
+        ).fetchone()[0]
+
+        lignes_compteurs = executer(
+            con,
+            "SELECT utilisateur, type_fiche, COUNT(DISTINCT code) "
+            "FROM appels WHERE jour=? AND origine=? "
+            "GROUP BY utilisateur, type_fiche",
+            (dt.date.today().isoformat(), ORIGINE_APPEL),
+        ).fetchall()
+
+    compteurs = {
+        (str(utilisateur), str(type_fiche)): int(nombre)
+        for utilisateur, type_fiche, nombre in lignes_compteurs
+    }
+    LOGGER.info(
+        "PERF lecture état courant: %.0f ms (%d clients, %d adresses)",
+        (time.perf_counter() - debut) * 1000,
+        len(suivi),
+        len(suivi_adresses),
+    )
+    return suivi, suivi_adresses, int(modifs), compteurs
+
+
+def invalider_etat_courant() -> None:
+    """Force la prochaine exécution à relire les données venant d'être écrites."""
+    charger_etat_courant.clear()
+
+
 # Champs pour lesquels une valeur vide transmise à l'enregistrement est presque
 # toujours accidentelle : une date qui n'a pas pu être relue, un champ non
 # réaffiché, un formulaire partiellement rempli. Ils ne sont jamais écrasés par
@@ -651,7 +714,8 @@ def _fusionner(existant: dict, champs: dict, proteges: tuple, effacements: Itera
     return fusion
 
 
-def enregistrer(code: str, utilisateur: str, effacements: Iterable[str] = (), **champs) -> None:
+def enregistrer(code: str, utilisateur: str, effacements: Iterable[str] = (),
+                invalider_cache: bool = True, **champs) -> None:
     """Enregistre une fiche sans jamais perdre une information déjà saisie.
 
     Les champs listés dans `effacements` sont les seuls que l'on accepte de
@@ -673,10 +737,13 @@ def enregistrer(code: str, utilisateur: str, effacements: Iterable[str] = (), **
             list(champs.values()),
         )
         _historiser(con, utilisateur, "client", code, champs)
+    if invalider_cache:
+        invalider_etat_courant()
 
 
 def enregistrer_adresse(code_adresse: str, utilisateur: str,
-                        effacements: Iterable[str] = (), **champs) -> None:
+                        effacements: Iterable[str] = (),
+                        invalider_cache: bool = True, **champs) -> None:
     """Même protection que pour les fiches clients."""
     champs = _fusionner(lire_fiche_adresse(code_adresse), champs,
                         CHAMPS_PROTEGES_ADR, effacements)
@@ -694,6 +761,8 @@ def enregistrer_adresse(code_adresse: str, utilisateur: str,
             list(champs.values()),
         )
         _historiser(con, utilisateur, "adresse", code_adresse, champs)
+    if invalider_cache:
+        invalider_etat_courant()
 
 
 def nb_modifs_depuis_export() -> int:
@@ -718,6 +787,7 @@ def reinitialiser_tout(auteur: str = "") -> None:
     with connexion() as con:
         for t in ("suivi", "suivi_adresses", "meta", "verrous", "journal", "appels"):
             executer(con, f"DELETE FROM {t}")
+    invalider_etat_courant()
     if auteur:
         journaliser(auteur, "Réinitialisation complète", "—",
                     "Suivi, référents et journal antérieur effacés.")
@@ -747,6 +817,7 @@ def journaliser_appel(utilisateur: str, type_fiche: str, code: str,
             (maintenant.isoformat(timespec="seconds"), maintenant.date().isoformat(),
              utilisateur, type_fiche, str(code), statut, origine),
         )
+    invalider_etat_courant()
 
 
 def charger_appels(depuis: dt.date | None = None) -> pd.DataFrame:
@@ -811,6 +882,7 @@ def reattribuer(code: str, traitant: str, statut: str, auteur: str, ancien: dict
             **ancien, "code_client": str(code), "statut": statut,
             "traite_par": traitant, "maj_le": maintenant_iso(),
         })
+    invalider_etat_courant()
     journaliser_appel(auteur, "client", code, statut, ORIGINE_REATTRIBUTION)
     journaliser(
         auteur, "Réattribution de fiche", code,
@@ -960,6 +1032,7 @@ def importer_suivi_clients_csv(fichier) -> int:
         enregistrer(
             code,
             utilisateur=val(ligne, "traite_par"),   # on conserve l'auteur d'origine
+            invalider_cache=False,                   # une seule invalidation après l'import
             # La restauration fait foi : elle réécrit la fiche telle qu'exportée,
             # y compris les champs vides.
             effacements=CHAMPS_PROTEGES + ("traite_par",),
@@ -1009,6 +1082,7 @@ def importer_suivi_adresses_csv(fichier) -> int:
         enregistrer_adresse(
             code,
             utilisateur=val(ligne, "traite_par"),
+            invalider_cache=False,
             effacements=CHAMPS_PROTEGES_ADR + ("traite_par",),
             referent=val(ligne, "referent"),
             tel_site=val(ligne, "tel_site"),
@@ -1312,6 +1386,58 @@ MOIS_LONGS = ["janvier", "février", "mars", "avril", "mai", "juin",
               "juillet", "août", "septembre", "octobre", "novembre", "décembre"]
 
 
+def deplacer_index(cle: str, pas: int, maximum: int | None = None,
+                   minimum: int | None = 0) -> None:
+    """Callback exécuté avant le rerun naturel du bouton.
+
+    Cela évite le second `st.rerun()` qui doublait le temps d'attente de tous
+    les boutons Précédent/Suivant.
+    """
+    valeur = int(st.session_state.get(cle, 0)) + pas
+    if minimum is not None:
+        valeur = max(minimum, valeur)
+    if maximum is not None:
+        valeur = min(valeur, maximum)
+    st.session_state[cle] = valeur
+
+
+def choisir_file_rappel(valeur: str) -> None:
+    st.session_state.jour_rappel = valeur
+    st.session_state.pop("idx", None)
+
+
+def quitter_file_speciale(cle: str) -> None:
+    st.session_state.pop(cle, None)
+    st.session_state.pop("idx", None)
+
+
+def terminer_demo() -> None:
+    st.session_state.demo_active = False
+
+
+def basculer_date_detail(cle: str, valeur: str) -> None:
+    if st.session_state.get(cle) == valeur:
+        st.session_state.pop(cle, None)
+    else:
+        st.session_state[cle] = valeur
+
+
+def ouvrir_fiche(code: str) -> None:
+    st.session_state.saut_code = str(code)
+
+
+def ouvrir_demo() -> None:
+    st.session_state.demo_active = True
+    st.session_state.demo_etape = 0
+
+
+def deconnecter() -> None:
+    for cle in ("utilisateur", "role", "idx", "idx_adr", "demo_active",
+                "demo_etape", "saut_code", "jour_rappel", "cal_decalage",
+                "grille_jour_detail", "bande_jour_detail", "navigation_principale"):
+        st.session_state.pop(cle, None)
+
+
 def bande_sept_jours(rappels: pd.DataFrame, prefixe: str) -> None:
     """Sept prochains jours, au-dessus de la file d'appel.
 
@@ -1340,17 +1466,22 @@ def bande_sept_jours(rappels: pd.DataFrame, prefixe: str) -> None:
             "<div class='n'>" + (str(n) if n else "—") + "</div></div>",
             unsafe_allow_html=True,
         )
-        if col.button("Voir" if n else "—", key=prefixe + "_" + jour.isoformat(),
-                      disabled=(n == 0), width="stretch"):
-            st.session_state.jour_rappel = jour.isoformat()
-            st.session_state.pop("idx", None)
-            st.rerun()
+        col.button(
+            "Voir" if n else "—",
+            key=prefixe + "_" + jour.isoformat(),
+            disabled=(n == 0),
+            width="stretch",
+            on_click=choisir_file_rappel,
+            args=(jour.isoformat(),),
+        )
 
     if retard:
-        if st.button("⏰ Voir les " + str(retard) + " rappel(s) en retard", key=prefixe + "_retard"):
-            st.session_state.jour_rappel = "retard"
-            st.session_state.pop("idx", None)
-            st.rerun()
+        st.button(
+            "⏰ Voir les " + str(retard) + " rappel(s) en retard",
+            key=prefixe + "_retard",
+            on_click=choisir_file_rappel,
+            args=("retard",),
+        )
 
 
 def grille_mensuelle(rappels: pd.DataFrame, prefixe: str, col_code: str = "Code client") -> None:
@@ -1373,12 +1504,14 @@ def grille_mensuelle(rappels: pd.DataFrame, prefixe: str, col_code: str = "Code 
     mois = mois % 12 + 1
 
     n1, n2, n3 = st.columns([1, 3, 1])
-    if n1.button("◀ Mois précédent", key=prefixe + "_prec", width="stretch"):
-        st.session_state.cal_decalage -= 1
-        st.rerun()
-    if n3.button("Mois suivant ▶", key=prefixe + "_suiv", width="stretch"):
-        st.session_state.cal_decalage += 1
-        st.rerun()
+    n1.button(
+        "◀ Mois précédent", key=prefixe + "_prec", width="stretch",
+        on_click=deplacer_index, args=("cal_decalage", -1, None, None),
+    )
+    n3.button(
+        "Mois suivant ▶", key=prefixe + "_suiv", width="stretch",
+        on_click=deplacer_index, args=("cal_decalage", 1, None, None),
+    )
     n2.markdown(
         "<div style='text-align:center;font-weight:700;color:" + VERT_FONCE +
         ";padding-top:6px'>" + MOIS_LONGS[mois - 1] + " " + str(annee) + "</div>",
@@ -1520,15 +1653,14 @@ def selecteur_journees(rappels: pd.DataFrame, premier: dt.date, dernier: dt.date
             marque = "⏰ " if jour < dt.date.today() else ""
             libelle = marque + jour.strftime("%d/%m") + " · " + str(n)
             actif = st.session_state.get(cle_etat) == jour.isoformat()
-            if col.button(libelle, key=prefixe + "_j_" + jour.isoformat(),
-                          width="stretch",
-                          type="primary" if actif else "secondary"):
-                # Un second clic sur la même journée referme le détail.
-                if actif:
-                    st.session_state.pop(cle_etat, None)
-                else:
-                    st.session_state[cle_etat] = jour.isoformat()
-                st.rerun()
+            col.button(
+                libelle,
+                key=prefixe + "_j_" + jour.isoformat(),
+                width="stretch",
+                type="primary" if actif else "secondary",
+                on_click=basculer_date_detail,
+                args=(cle_etat, jour.isoformat()),
+            )
 
     choisi = st.session_state.get(cle_etat)
     if choisi:
@@ -1584,11 +1716,12 @@ def rapport_journalier(jours: int = 30) -> dict:
     }
 
 
-def stats_utilisateur(suivi_df: pd.DataFrame, suivi_adr: pd.DataFrame, nom: str) -> dict:
+def stats_utilisateur(suivi_df: pd.DataFrame, suivi_adr: pd.DataFrame, nom: str,
+                      compteurs_appels: dict | None = None) -> dict:
     """Indicateurs d'activité d'une commerciale."""
-    aujourdhui = dt.date.today()
     s = suivi_df[suivi_df["traite_par"] == nom] if not suivi_df.empty else pd.DataFrame()
     a = suivi_adr[suivi_adr["traite_par"] == nom] if not suivi_adr.empty else pd.DataFrame()
+    compteurs_appels = compteurs_appels or {}
 
     return {
         "fiches": len(s),
@@ -1596,10 +1729,10 @@ def stats_utilisateur(suivi_df: pd.DataFrame, suivi_adr: pd.DataFrame, nom: str)
         # Compté depuis le journal des appels, et non depuis la date de dernière
         # modification de la fiche : une réattribution en masse ne doit pas
         # apparaître comme une journée de deux cents appels.
-        "aujourdhui": compter_appels(aujourdhui, nom, "client"),
+        "aujourdhui": int(compteurs_appels.get((nom, "client"), 0)),
         "a_rappeler": int((s["statut"] == "À rappeler").sum()) if not s.empty else 0,
         "points": len(a),
-        "points_aujourdhui": compter_appels(aujourdhui, nom, "adresse"),
+        "points_aujourdhui": int(compteurs_appels.get((nom, "adresse"), 0)),
         "rythme": calculer_rythme(suivi_df, nom),
     }
 
@@ -1718,20 +1851,23 @@ def afficher_demo(role: str) -> None:
                     f"{texte}</div>", unsafe_allow_html=True)
         st.progress((idx + 1) / len(etapes))
         c1, c2, c3 = st.columns([1, 1, 1])
-        if c1.button("⬅️ Précédent", disabled=(idx == 0), width="stretch", key="demo_prec"):
-            st.session_state.demo_etape = idx - 1
-            st.rerun()
+        c1.button(
+            "⬅️ Précédent", disabled=(idx == 0), width="stretch", key="demo_prec",
+            on_click=deplacer_index, args=("demo_etape", -1, len(etapes) - 1),
+        )
         if idx < len(etapes) - 1:
-            if c2.button("Suivant ➡️", type="primary", width="stretch", key="demo_suiv"):
-                st.session_state.demo_etape = idx + 1
-                st.rerun()
+            c2.button(
+                "Suivant ➡️", type="primary", width="stretch", key="demo_suiv",
+                on_click=deplacer_index, args=("demo_etape", 1, len(etapes) - 1),
+            )
         else:
-            if c2.button("Terminer", type="primary", width="stretch", key="demo_fin"):
-                st.session_state.demo_active = False
-                st.rerun()
-        if c3.button("Fermer", width="stretch", key="demo_close"):
-            st.session_state.demo_active = False
-            st.rerun()
+            c2.button(
+                "Terminer", type="primary", width="stretch", key="demo_fin",
+                on_click=terminer_demo,
+            )
+        c3.button(
+            "Fermer", width="stretch", key="demo_close", on_click=terminer_demo,
+        )
 
     # Rendu dans le flux de la page plutôt que dans une fenêtre modale.
     # st.dialog était rappelé à chaque exécution du script tant que la démo
@@ -1915,8 +2051,7 @@ if col_code is None:
     st.error("La feuille « Clients » doit contenir une colonne « Code client ».")
     st.stop()
 
-suivi = charger_suivi()
-suivi_adr = charger_suivi_adresses()
+suivi, suivi_adr, modifs_en_attente, compteurs_appels = charger_etat_courant()
 
 base = clients.merge(suivi, left_on=col_code, right_on="code_client", how="left")
 for c in ["statut", "existe", "produits", "email_maj", "tel_maj", "note",
@@ -1925,9 +2060,11 @@ for c in ["statut", "existe", "produits", "email_maj", "tel_maj", "note",
 base["statut"] = base["statut"].replace("", "À appeler")
 base["priorite"] = base["Type client"].map(priorite)
 
-modifs_en_attente = nb_modifs_depuis_export()
 rythme_global = calculer_rythme(suivi)
-stats = {nom: stats_utilisateur(suivi, suivi_adr, nom) for nom in COMMERCIALES}
+stats = {
+    nom: stats_utilisateur(suivi, suivi_adr, nom, compteurs_appels)
+    for nom in COMMERCIALES
+} if PEUT_PILOTER else {}
 
 # Calculés une seule fois : la barre latérale et le bandeau les réutilisent.
 PEUT_TRAITER_TMP = ROLE in ("commercial", "admin")
@@ -1960,29 +2097,22 @@ with st.sidebar:
     # Rafraîchissement : les données du suivi sont relues à chaque exécution,
     # ce bouton force donc l'affichage des saisies faites par les autres depuis
     # l'ouverture de la page.
-    if st.button("🔄 Actualiser les données", width="stretch", type="primary",
-                 help="Recharge le suivi pour voir en temps réel ce que les autres "
-                      "ont enregistré depuis votre dernière action."):
-        st.cache_data.clear()
-        st.rerun()
+    st.button(
+        "🔄 Actualiser les données", width="stretch", type="primary",
+        help="Recharge le suivi pour voir en temps réel ce que les autres "
+             "ont enregistré depuis votre dernière action.",
+        on_click=invalider_etat_courant,
+    )
     st.caption(f"Données à jour au {dt.datetime.now().strftime('%H:%M:%S')}")
 
     sc1, sc2 = st.columns(2)
-    if sc1.button("🎓 Revoir la démo", width="stretch"):
-        st.session_state.demo_active = True
-        st.session_state.demo_etape = 0
-        st.rerun()
-    if sc2.button("🚪 Déconnexion", width="stretch"):
-        for cle in ("utilisateur", "role", "idx", "idx_adr", "demo_active",
-                    "demo_etape", "saut_code", "jour_rappel", "cal_decalage",
-                    "grille_jour_detail", "bande_jour_detail", "navigation_principale"):
-            st.session_state.pop(cle, None)
-        st.rerun()
+    sc1.button("🎓 Revoir la démo", width="stretch", on_click=ouvrir_demo)
+    sc2.button("🚪 Déconnexion", width="stretch", on_click=deconnecter)
 
     if PEUT_TRAITER:
         st.divider()
         st.header("Mes chiffres")
-        moi = stats_utilisateur(suivi, suivi_adr, UTILISATEUR)
+        moi = stats_utilisateur(suivi, suivi_adr, UTILISATEUR, compteurs_appels)
         st.metric("Appels enregistrés aujourd'hui", formater_entier(moi["aujourdhui"]),
                   help="Clients distincts appelés depuis ce matin. Les corrections "
                        "administratives n'y figurent pas.")
@@ -2118,9 +2248,11 @@ def _detail_rappels(df: pd.DataFrame, avec_bouton: bool) -> None:
                if r.get("note") else ""),
             unsafe_allow_html=True,
         )
-        if avec_bouton and c2.button("Ouvrir", key=f"saut_{r[col_code]}", width="stretch"):
-            st.session_state.saut_code = str(r[col_code])
-            st.rerun()
+        if avec_bouton:
+            c2.button(
+                "Ouvrir", key=f"saut_{r[col_code]}", width="stretch",
+                on_click=ouvrir_fiche, args=(str(r[col_code]),),
+            )
 
 if PEUT_TRAITER and not mes_rappels.empty:
     en_retard = int((mes_rappels["date_rappel"] < aujourdhui).sum())
@@ -2244,16 +2376,16 @@ if PEUT_TRAITER:
             # Qui appeler, à quel numéro, et ce qui avait été noté la fois d'avant.
             with st.expander("📋 La liste des clients à rappeler", expanded=True):
                 tableau_rappels(du_jour, col_code)
-            if st.button("↩︎ Revenir à ma file d'appel", key="retour_jour"):
-                st.session_state.pop("jour_rappel", None)
-                st.session_state.pop("idx", None)
-                st.rerun()
+            st.button(
+                "↩︎ Revenir à ma file d'appel", key="retour_jour",
+                on_click=quitter_file_speciale, args=("jour_rappel",),
+            )
 
         if st.session_state.get("saut_code"):
-            if st.button("↩︎ Revenir à ma file d'appel"):
-                st.session_state.pop("saut_code", None)
-                st.session_state.pop("idx", None)
-                st.rerun()
+            st.button(
+                "↩︎ Revenir à ma file d'appel",
+                on_click=quitter_file_speciale, args=("saut_code",),
+            )
 
         if file_appel.empty:
             st.success("Aucun client dans la file avec ces filtres. 🎉")
@@ -2266,12 +2398,14 @@ if PEUT_TRAITER:
             st.session_state.idx = max(0, min(st.session_state.idx, len(file_appel) - 1))
 
             nav1, nav2, nav3 = st.columns([1, 2, 1])
-            if nav1.button("⬅️ Précédent", width="stretch"):
-                st.session_state.idx = max(0, st.session_state.idx - 1)
-                st.rerun()
-            if nav3.button("Suivant ➡️", width="stretch"):
-                st.session_state.idx = min(len(file_appel) - 1, st.session_state.idx + 1)
-                st.rerun()
+            nav1.button(
+                "⬅️ Précédent", width="stretch", on_click=deplacer_index,
+                args=("idx", -1, len(file_appel) - 1),
+            )
+            nav3.button(
+                "Suivant ➡️", width="stretch", on_click=deplacer_index,
+                args=("idx", 1, len(file_appel) - 1),
+            )
             nav2.markdown(
                 f"<div style='text-align:center;font-weight:600;color:{VERT}'>"
                 f"Fiche {st.session_state.idx + 1} / {len(file_appel)}</div>",
@@ -2583,12 +2717,14 @@ if PEUT_TRAITER:
                 st.session_state.idx_adr = max(0, min(st.session_state.idx_adr, len(vue) - 1))
 
                 n1, n2, n3 = st.columns([1, 2, 1])
-                if n1.button("⬅️ Précédent", key="adr_prev", width="stretch"):
-                    st.session_state.idx_adr = max(0, st.session_state.idx_adr - 1)
-                    st.rerun()
-                if n3.button("Suivant ➡️", key="adr_next", width="stretch"):
-                    st.session_state.idx_adr = min(len(vue) - 1, st.session_state.idx_adr + 1)
-                    st.rerun()
+                n1.button(
+                    "⬅️ Précédent", key="adr_prev", width="stretch",
+                    on_click=deplacer_index, args=("idx_adr", -1, len(vue) - 1),
+                )
+                n3.button(
+                    "Suivant ➡️", key="adr_next", width="stretch",
+                    on_click=deplacer_index, args=("idx_adr", 1, len(vue) - 1),
+                )
                 n2.markdown(
                     f"<div style='text-align:center;font-weight:600;color:{VERT}'>"
                     f"Point {st.session_state.idx_adr + 1} / {len(vue)}</div>",
@@ -2741,6 +2877,7 @@ if PEUT_TRAITER:
             st.caption("Une fois les deux fichiers téléchargés, confirme pour repasser au vert :")
             if st.button("✅ J'ai bien téléchargé mes sauvegardes", type="primary"):
                 ecrire_meta("dernier_export", maintenant_iso())
+                invalider_etat_courant()
                 st.rerun()
 
 
@@ -2829,7 +2966,7 @@ if PEUT_PILOTER:
         # global, mais signalée à part : le suivi des commerciales reste lisible.
         admins = [n for n, prof in PROFILS.items() if prof["role"] == "admin"]
         for nom in admins:
-            s_admin = stats_utilisateur(suivi, suivi_adr, nom)
+            s_admin = stats_utilisateur(suivi, suivi_adr, nom, compteurs_appels)
             if s_admin["fiches"] or s_admin["points"]:
                 st.caption(
                     f"Hors périmètre commercial : {formater_entier(s_admin['fiches'])} fiche(s) "
@@ -2981,3 +3118,10 @@ if PEUT_PILOTER:
                 "Profil administrateur : accès complet aux onglets de travail et de pilotage. "
                 "La réinitialisation reste réservée au profil manager."
             )
+
+LOGGER.info(
+    "PERF rendu serveur complet: %.0f ms (écran=%s, rôle=%s)",
+    (time.perf_counter() - DEBUT_RENDU) * 1000,
+    onglet_actif,
+    ROLE,
+)

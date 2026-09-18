@@ -41,6 +41,8 @@ from __future__ import annotations
 
 import hashlib
 import io
+import json
+import logging
 import os
 import random
 import re
@@ -53,6 +55,11 @@ from typing import Iterable
 
 import pandas as pd
 import streamlit as st
+
+try:
+    import psycopg
+except ImportError:  # Le mode SQLite local reste utilisable sans PostgreSQL.
+    psycopg = None
 
 # Scripts d'appel et objections par typologie (fichier script.py, même dossier).
 # Le module est autonome : il ne touche ni à la base, ni à st.session_state.
@@ -68,6 +75,27 @@ DOSSIER_DONNEES.mkdir(parents=True, exist_ok=True)
 DB_PATH = DOSSIER_DONNEES / "suivi_appels.db"
 DOSSIER_SAUVEGARDES = DOSSIER_DONNEES / "sauvegardes"
 DOSSIER_SAUVEGARDES.mkdir(parents=True, exist_ok=True)
+
+
+def _url_base_distante() -> str:
+    """Lit l'URL PostgreSQL sans jamais l'inscrire dans le dépôt ou les logs."""
+    valeur = os.environ.get("HYMPYR_DATABASE_URL", "").strip()
+    if valeur:
+        return valeur
+    try:
+        return str(st.secrets["database"]["url"]).strip()
+    except Exception:
+        return ""
+
+
+DATABASE_URL = _url_base_distante()
+BASE_DISTANTE = bool(DATABASE_URL)
+
+logging.basicConfig(
+    level=os.environ.get("HYMPYR_LOG_LEVEL", "INFO"),
+    format="%(asctime)s %(levelname)s %(name)s %(message)s",
+)
+LOGGER = logging.getLogger("hympyr.cockpit")
 
 VERT, VERT_FONCE, ORANGE, GRIS = "#1A6B45", "#0D3D27", "#FF5C29", "#8E9A94"
 BLEU = "#2F5D8C"   # profil administrateur
@@ -98,7 +126,7 @@ PROFILS = {
     "Quentin": {
         "role": "admin",
         "couleur": BLEU,
-        # Mot de passe provisoire : QDEadmin8131@!!  — à changer, voir empreinte().
+        # Valeur de secours locale. En production, utiliser st.secrets.
         "empreinte": "c6d1892f279428bcd9e60975e74de88fef32ba28c6d080d5475640d60e5c10cc",
     },
 }
@@ -322,34 +350,88 @@ def pastille_traitement(traite_par: str) -> str:
 
 @contextmanager
 def connexion():
-    """Connexion à la base de suivi.
+    """Connexion transactionnelle à PostgreSQL, ou SQLite en développement.
 
-    Le mode WAL n'est PAS réglé ici : c'est un réglage persistant du fichier,
-    posé une fois à l'initialisation. L'exécuter à chaque connexion réclamait un
-    verrou exclusif momentané — à plusieurs utilisateurs, les connexions
-    s'attendaient les unes les autres et l'application semblait figée.
+    PostgreSQL est indispensable sur Streamlit Cloud : le disque du conteneur
+    ne constitue pas une sauvegarde durable. Une courte reprise automatique
+    absorbe les micro-coupures réseau sans faire échouer toute l'application.
     """
-    con = sqlite3.connect(DB_PATH, timeout=30, check_same_thread=False)
+    con = None
+    derniere_erreur = None
+    for tentative in range(3):
+        try:
+            if BASE_DISTANTE:
+                if psycopg is None:
+                    raise RuntimeError(
+                        "HYMPYR_DATABASE_URL est défini mais psycopg n'est pas installé."
+                    )
+                con = psycopg.connect(DATABASE_URL, connect_timeout=8)
+            else:
+                con = sqlite3.connect(DB_PATH, timeout=30, check_same_thread=False)
+                con.execute("PRAGMA busy_timeout=30000")
+            break
+        except Exception as exc:
+            derniere_erreur = exc
+            if tentative < 2:
+                time.sleep(0.25 * (tentative + 1))
+    if con is None:
+        raise RuntimeError("Connexion à la base de données impossible") from derniere_erreur
     try:
-        con.execute("PRAGMA busy_timeout=30000")
         yield con
         con.commit()
+    except Exception:
+        con.rollback()
+        raise
     finally:
         con.close()
+
+
+def _sql(requete: str) -> str:
+    """Adapte les paramètres qmark historiques au pilote PostgreSQL."""
+    return requete.replace("?", "%s") if BASE_DISTANTE else requete
+
+
+def executer(con, requete: str, parametres=()):
+    return con.execute(_sql(requete), parametres)
+
+
+def lire_tableau(requete: str, parametres=()) -> pd.DataFrame:
+    """Lecture indépendante du pilote, sans dépendre des heuristiques pandas."""
+    with connexion() as con:
+        curseur = executer(con, requete, parametres)
+        lignes = curseur.fetchall()
+        colonnes = [description[0] for description in curseur.description]
+    return pd.DataFrame(lignes, columns=colonnes).fillna("")
+
+
+def colonnes_table(con, table: str) -> list[str]:
+    if BASE_DISTANTE:
+        lignes = executer(
+            con,
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_schema = current_schema() AND table_name = ? "
+            "ORDER BY ordinal_position",
+            (table,),
+        ).fetchall()
+        return [r[0] for r in lignes]
+    return [r[1] for r in executer(con, f"PRAGMA table_info({table})").fetchall()]
 
 
 def initialiser_base() -> None:
-    # Réglages persistants du fichier de base : posés une seule fois.
-    con = sqlite3.connect(DB_PATH, timeout=30, check_same_thread=False)
-    try:
-        con.execute("PRAGMA journal_mode=WAL")
-        con.execute("PRAGMA synchronous=NORMAL")
-        con.commit()
-    finally:
-        con.close()
+    if not BASE_DISTANTE:
+        # Réglages persistants du fichier SQLite : posés une seule fois.
+        con = sqlite3.connect(DB_PATH, timeout=30, check_same_thread=False)
+        try:
+            con.execute("PRAGMA journal_mode=WAL")
+            con.execute("PRAGMA synchronous=FULL")
+            con.commit()
+        finally:
+            con.close()
+
+    identifiant = "BIGSERIAL PRIMARY KEY" if BASE_DISTANTE else "INTEGER PRIMARY KEY AUTOINCREMENT"
 
     with connexion() as con:
-        con.execute("""
+        executer(con, """
             CREATE TABLE IF NOT EXISTS suivi (
                 code_client   TEXT PRIMARY KEY,
                 statut        TEXT, existe TEXT, produits TEXT,
@@ -358,22 +440,31 @@ def initialiser_base() -> None:
                 traite_par    TEXT, maj_le TEXT
             )
         """)
-        con.execute("""
+        executer(con, """
             CREATE TABLE IF NOT EXISTS suivi_adresses (
                 code_adresse  TEXT PRIMARY KEY,
                 referent      TEXT, tel_site TEXT, statut_adr TEXT,
                 note_adr      TEXT, traite_par TEXT, maj_le TEXT
             )
         """)
-        con.execute("CREATE TABLE IF NOT EXISTS meta (cle TEXT PRIMARY KEY, valeur TEXT)")
+        executer(con, "CREATE TABLE IF NOT EXISTS meta (cle TEXT PRIMARY KEY, valeur TEXT)")
+        executer(con, """
+            CREATE TABLE IF NOT EXISTS fichiers (
+                cle TEXT PRIMARY KEY, nom TEXT, contenu BYTEA, maj_le TEXT
+            )
+        """ if BASE_DISTANTE else """
+            CREATE TABLE IF NOT EXISTS fichiers (
+                cle TEXT PRIMARY KEY, nom TEXT, contenu BLOB, maj_le TEXT
+            )
+        """)
         # Journal des appels : une ligne par enregistrement, jamais écrasée.
         # La table « suivi » ne conserve qu'un état — une ligne par client,
         # remplacée à chaque modification. Impossible d'en déduire combien
         # d'appels ont été passés un jour donné : une réattribution en masse y
         # ressemble à des centaines d'appels. D'où ce journal séparé.
-        con.execute("""
+        executer(con, f"""
             CREATE TABLE IF NOT EXISTS appels (
-                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                id          {identifiant},
                 horodatage  TEXT,
                 jour        TEXT,
                 utilisateur TEXT,
@@ -383,9 +474,9 @@ def initialiser_base() -> None:
                 origine     TEXT
             )
         """)
-        con.execute("""
+        executer(con, f"""
             CREATE TABLE IF NOT EXISTS journal (
-                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                id          {identifiant},
                 horodatage  TEXT,
                 auteur      TEXT,
                 action      TEXT,
@@ -393,7 +484,7 @@ def initialiser_base() -> None:
                 detail      TEXT
             )
         """)
-        con.execute("""
+        executer(con, """
             CREATE TABLE IF NOT EXISTS verrous (
                 cle        TEXT PRIMARY KEY,
                 type_fiche TEXT,
@@ -402,19 +493,31 @@ def initialiser_base() -> None:
                 depuis     TEXT
             )
         """)
-        # Migrations sur base existante
+        executer(con, f"""
+            CREATE TABLE IF NOT EXISTS historique (
+                id          {identifiant},
+                horodatage  TEXT,
+                auteur      TEXT,
+                type_fiche  TEXT,
+                code        TEXT,
+                donnees     TEXT
+            )
+        """)
+        # Migrations sur base existante.
         for table, colonnes in (
             ("suivi", ("motif_sortie", "rappel_date", "traite_par")),
             ("suivi_adresses", ("traite_par",)),
         ):
-            existantes = {r[1] for r in con.execute(f"PRAGMA table_info({table})").fetchall()}
+            existantes = set(colonnes_table(con, table))
             for c in colonnes:
                 if c not in existantes:
-                    con.execute(f"ALTER TABLE {table} ADD COLUMN {c} TEXT")
-        con.execute("CREATE INDEX IF NOT EXISTS idx_suivi_maj ON suivi(maj_le)")
-        con.execute("CREATE INDEX IF NOT EXISTS idx_suivi_qui ON suivi(traite_par)")
-        con.execute("CREATE INDEX IF NOT EXISTS idx_adr_maj ON suivi_adresses(maj_le)")
-        con.execute("CREATE INDEX IF NOT EXISTS idx_appels_jour ON appels(jour, utilisateur)")
+                    executer(con, f"ALTER TABLE {table} ADD COLUMN {c} TEXT")
+        executer(con, "CREATE INDEX IF NOT EXISTS idx_suivi_maj ON suivi(maj_le)")
+        executer(con, "CREATE INDEX IF NOT EXISTS idx_suivi_qui ON suivi(traite_par)")
+        executer(con, "CREATE INDEX IF NOT EXISTS idx_adr_maj ON suivi_adresses(maj_le)")
+        executer(con, "CREATE INDEX IF NOT EXISTS idx_appels_jour ON appels(jour, utilisateur)")
+        executer(con, "CREATE INDEX IF NOT EXISTS idx_historique_cible "
+                      "ON historique(type_fiche, code, horodatage)")
 
 
 initialiser_base()
@@ -422,27 +525,58 @@ initialiser_base()
 
 def lire_meta(cle: str, defaut: str = "") -> str:
     with connexion() as con:
-        r = con.execute("SELECT valeur FROM meta WHERE cle=?", (cle,)).fetchone()
+        r = executer(con, "SELECT valeur FROM meta WHERE cle=?", (cle,)).fetchone()
     return r[0] if r else defaut
 
 
 def ecrire_meta(cle: str, valeur: str) -> None:
     with connexion() as con:
-        con.execute(
+        executer(con,
             "INSERT INTO meta (cle, valeur) VALUES (?, ?) "
             "ON CONFLICT(cle) DO UPDATE SET valeur=excluded.valeur",
             (cle, str(valeur)),
         )
 
 
-def charger_suivi() -> pd.DataFrame:
+def enregistrer_fichier_maitre(nom: str, contenu: bytes) -> None:
+    """Conserve le classeur source dans la base durable pour les redémarrages."""
     with connexion() as con:
-        return pd.read_sql("SELECT * FROM suivi", con, dtype=str).fillna("")
+        executer(
+            con,
+            "INSERT INTO fichiers (cle, nom, contenu, maj_le) VALUES (?,?,?,?) "
+            "ON CONFLICT(cle) DO UPDATE SET nom=excluded.nom, "
+            "contenu=excluded.contenu, maj_le=excluded.maj_le",
+            ("fichier_maitre", nom, contenu, maintenant_iso()),
+        )
+
+
+def charger_fichier_maitre() -> tuple[str, bytes, str] | None:
+    with connexion() as con:
+        ligne = executer(
+            con, "SELECT nom, contenu, maj_le FROM fichiers WHERE cle=?", ("fichier_maitre",)
+        ).fetchone()
+    if not ligne:
+        return None
+    return str(ligne[0]), bytes(ligne[1]), str(ligne[2])
+
+
+def _historiser(con, auteur: str, type_fiche: str, code: str, donnees: dict) -> None:
+    """Version immuable de chaque fiche, écrite dans la même transaction."""
+    executer(
+        con,
+        "INSERT INTO historique (horodatage, auteur, type_fiche, code, donnees) "
+        "VALUES (?,?,?,?,?)",
+        (maintenant_iso(), auteur, type_fiche, str(code),
+         json.dumps(donnees, ensure_ascii=False, sort_keys=True)),
+    )
+
+
+def charger_suivi() -> pd.DataFrame:
+    return lire_tableau("SELECT * FROM suivi")
 
 
 def charger_suivi_adresses() -> pd.DataFrame:
-    with connexion() as con:
-        return pd.read_sql("SELECT * FROM suivi_adresses", con, dtype=str).fillna("")
+    return lire_tableau("SELECT * FROM suivi_adresses")
 
 
 # Champs pour lesquels une valeur vide transmise à l'enregistrement est presque
@@ -457,16 +591,16 @@ CHAMPS_PROTEGES_ADR = ("referent", "tel_site", "note_adr")
 def lire_fiche(code: str) -> dict:
     """État actuel d'une fiche en base, ou dictionnaire vide si elle n'existe pas."""
     with connexion() as con:
-        colonnes = [r[1] for r in con.execute("PRAGMA table_info(suivi)").fetchall()]
-        ligne = con.execute("SELECT * FROM suivi WHERE code_client=?", (str(code),)).fetchone()
+        colonnes = colonnes_table(con, "suivi")
+        ligne = executer(con, "SELECT * FROM suivi WHERE code_client=?", (str(code),)).fetchone()
     return {c: (v if v is not None else "") for c, v in zip(colonnes, ligne)} if ligne else {}
 
 
 def lire_fiche_adresse(code: str) -> dict:
     with connexion() as con:
-        colonnes = [r[1] for r in con.execute("PRAGMA table_info(suivi_adresses)").fetchall()]
-        ligne = con.execute("SELECT * FROM suivi_adresses WHERE code_adresse=?",
-                            (str(code),)).fetchone()
+        colonnes = colonnes_table(con, "suivi_adresses")
+        ligne = executer(con, "SELECT * FROM suivi_adresses WHERE code_adresse=?",
+                         (str(code),)).fetchone()
     return {c: (v if v is not None else "") for c, v in zip(colonnes, ligne)} if ligne else {}
 
 
@@ -504,11 +638,12 @@ def enregistrer(code: str, utilisateur: str, effacements: Iterable[str] = (), **
     ph = ",".join("?" for _ in champs)
     upd = ",".join(f"{k}=excluded.{k}" for k in champs if k != "code_client")
     with connexion() as con:
-        con.execute(
+        executer(con,
             f"INSERT INTO suivi ({cols}) VALUES ({ph}) "
             f"ON CONFLICT(code_client) DO UPDATE SET {upd}",
             list(champs.values()),
         )
+        _historiser(con, utilisateur, "client", code, champs)
 
 
 def enregistrer_adresse(code_adresse: str, utilisateur: str,
@@ -524,24 +659,25 @@ def enregistrer_adresse(code_adresse: str, utilisateur: str,
     ph = ",".join("?" for _ in champs)
     upd = ",".join(f"{k}=excluded.{k}" for k in champs if k != "code_adresse")
     with connexion() as con:
-        con.execute(
+        executer(con,
             f"INSERT INTO suivi_adresses ({cols}) VALUES ({ph}) "
             f"ON CONFLICT(code_adresse) DO UPDATE SET {upd}",
             list(champs.values()),
         )
+        _historiser(con, utilisateur, "adresse", code_adresse, champs)
 
 
 def nb_modifs_depuis_export() -> int:
     ref = lire_meta("dernier_export", "1970-01-01T00:00:00")
     with connexion() as con:
-        n = con.execute("SELECT COUNT(*) FROM suivi WHERE maj_le > ?", (ref,)).fetchone()[0]
-        n += con.execute("SELECT COUNT(*) FROM suivi_adresses WHERE maj_le > ?", (ref,)).fetchone()[0]
+        n = executer(con, "SELECT COUNT(*) FROM suivi WHERE maj_le > ?", (ref,)).fetchone()[0]
+        n += executer(con, "SELECT COUNT(*) FROM suivi_adresses WHERE maj_le > ?", (ref,)).fetchone()[0]
     return int(n)
 
 
 def base_est_vide() -> bool:
     with connexion() as con:
-        n = con.execute("SELECT COUNT(*) FROM suivi").fetchone()[0]
+        n = executer(con, "SELECT COUNT(*) FROM suivi").fetchone()[0]
     return n == 0
 
 
@@ -551,7 +687,7 @@ def reinitialiser_tout(auteur: str = "") -> None:
     un historique orphelin renvoyant à des fiches disparues."""
     with connexion() as con:
         for t in ("suivi", "suivi_adresses", "meta", "verrous", "journal", "appels"):
-            con.execute(f"DELETE FROM {t}")
+            executer(con, f"DELETE FROM {t}")
     if auteur:
         journaliser(auteur, "Réinitialisation complète", "—",
                     "Suivi, référents et journal antérieur effacés.")
@@ -575,7 +711,7 @@ def journaliser_appel(utilisateur: str, type_fiche: str, code: str,
     """
     maintenant = dt.datetime.now()
     with connexion() as con:
-        con.execute(
+        executer(con,
             "INSERT INTO appels (horodatage, jour, utilisateur, type_fiche, code, statut, origine) "
             "VALUES (?,?,?,?,?,?,?)",
             (maintenant.isoformat(timespec="seconds"), maintenant.date().isoformat(),
@@ -590,8 +726,7 @@ def charger_appels(depuis: dt.date | None = None) -> pd.DataFrame:
     if depuis:
         requete += " WHERE jour >= ?"
         parametres = (depuis.isoformat(),)
-    with connexion() as con:
-        return pd.read_sql(requete, con, params=parametres, dtype=str).fillna("")
+    return lire_tableau(requete, parametres)
 
 
 def compter_appels(jour: dt.date, utilisateur: str | None = None,
@@ -608,24 +743,23 @@ def compter_appels(jour: dt.date, utilisateur: str | None = None,
         requete += " AND utilisateur = ?"
         parametres.append(utilisateur)
     with connexion() as con:
-        return int(con.execute(requete, parametres).fetchone()[0])
+        return int(executer(con, requete, parametres).fetchone()[0])
 
 
 def journaliser(auteur: str, action: str, cible: str, detail: str = "") -> None:
     """Trace une intervention manuelle. Sert de preuve en cas de contestation."""
     with connexion() as con:
-        con.execute(
+        executer(con,
             "INSERT INTO journal (horodatage, auteur, action, cible, detail) VALUES (?,?,?,?,?)",
             (maintenant_iso(), auteur, action, str(cible), detail),
         )
 
 
 def charger_journal(limite: int = 200) -> pd.DataFrame:
-    with connexion() as con:
-        return pd.read_sql(
-            "SELECT horodatage, auteur, action, cible, detail FROM journal "
-            "ORDER BY id DESC LIMIT ?", con, params=(limite,), dtype=str
-        ).fillna("")
+    return lire_tableau(
+        "SELECT horodatage, auteur, action, cible, detail FROM journal "
+        "ORDER BY id DESC LIMIT ?", (limite,)
+    )
 
 
 def reattribuer(code: str, traitant: str, statut: str, auteur: str, ancien: dict) -> None:
@@ -637,12 +771,16 @@ def reattribuer(code: str, traitant: str, statut: str, auteur: str, ancien: dict
     est inscrite au journal, avec l'état antérieur.
     """
     with connexion() as con:
-        con.execute(
+        executer(con,
             "INSERT INTO suivi (code_client, statut, traite_par, maj_le) VALUES (?,?,?,?) "
             "ON CONFLICT(code_client) DO UPDATE SET "
             "statut=excluded.statut, traite_par=excluded.traite_par, maj_le=excluded.maj_le",
             (str(code), statut, traitant, maintenant_iso()),
         )
+        _historiser(con, auteur, "client", code, {
+            **ancien, "code_client": str(code), "statut": statut,
+            "traite_par": traitant, "maj_le": maintenant_iso(),
+        })
     journaliser_appel(auteur, "client", code, statut, ORIGINE_REATTRIBUTION)
     journaliser(
         auteur, "Réattribution de fiche", code,
@@ -656,7 +794,7 @@ def reattribuer(code: str, traitant: str, statut: str, auteur: str, ancien: dict
 def poser_verrou(type_fiche: str, code: str, utilisateur: str) -> None:
     """Signale que cette personne regarde cette fiche, maintenant."""
     with connexion() as con:
-        con.execute(
+        executer(con,
             "INSERT INTO verrous (cle, type_fiche, code, utilisateur, depuis) VALUES (?,?,?,?,?) "
             "ON CONFLICT(cle) DO UPDATE SET utilisateur=excluded.utilisateur, depuis=excluded.depuis",
             (f"{type_fiche}:{code}:{utilisateur}", type_fiche, str(code), utilisateur, maintenant_iso()),
@@ -665,7 +803,7 @@ def poser_verrou(type_fiche: str, code: str, utilisateur: str) -> None:
         # balayage de table à chaque interaction, pour un gain nul.
         if random.random() < 0.05:
             limite = (dt.datetime.now() - dt.timedelta(minutes=VERROU_MINUTES * 3)).isoformat(timespec="seconds")
-            con.execute("DELETE FROM verrous WHERE depuis < ?", (limite,))
+            executer(con, "DELETE FROM verrous WHERE depuis < ?", (limite,))
 
 
 def marquer_presence(type_fiche: str, code: str, utilisateur: str) -> None:
@@ -690,7 +828,7 @@ def autres_sur_la_fiche(type_fiche: str, code: str, utilisateur: str) -> list[tu
     """Qui d'autre regarde cette fiche, et depuis combien de minutes."""
     limite = (dt.datetime.now() - dt.timedelta(minutes=VERROU_MINUTES)).isoformat(timespec="seconds")
     with connexion() as con:
-        lignes = con.execute(
+        lignes = executer(con,
             "SELECT utilisateur, depuis FROM verrous "
             "WHERE type_fiche=? AND code=? AND utilisateur<>? AND depuis >= ?",
             (type_fiche, str(code), utilisateur, limite),
@@ -709,7 +847,7 @@ def fiches_ouvertes_par_les_autres(type_fiche: str, utilisateur: str) -> set[str
     """Codes actuellement consultés par quelqu'un d'autre (verrou actif)."""
     limite = (dt.datetime.now() - dt.timedelta(minutes=VERROU_MINUTES)).isoformat(timespec="seconds")
     with connexion() as con:
-        lignes = con.execute(
+        lignes = executer(con,
             "SELECT code FROM verrous WHERE type_fiche=? AND utilisateur<>? AND depuis >= ?",
             (type_fiche, utilisateur, limite),
         ).fetchall()
@@ -720,16 +858,29 @@ def fiches_ouvertes_par_les_autres(type_fiche: str, utilisateur: str) -> set[str
 # SAUVEGARDE AUTOMATIQUE
 # ─────────────────────────────────────────────────────────────────────────────
 
-def sauvegarde_auto() -> None:
-    """Copie CSV du suivi à chaque enregistrement. Ne remplace pas l'export du soir."""
+def sauvegarde_auto() -> bool:
+    """Snapshot local de secours en SQLite ; PostgreSQL est déjà durable.
+
+    Les fichiers sont remplacés atomiquement pour qu'une interruption pendant
+    l'écriture ne détruise jamais la dernière copie valide.
+    """
+    st.session_state["_exports_prepares"] = False
+    if BASE_DISTANTE:
+        return True
     try:
         jour = dt.date.today().isoformat()
-        charger_suivi().to_csv(DOSSIER_SAUVEGARDES / f"suivi_{jour}.csv",
-                               index=False, sep=";", encoding="utf-8-sig")
-        charger_suivi_adresses().to_csv(DOSSIER_SAUVEGARDES / f"referents_{jour}.csv",
-                                        index=False, sep=";", encoding="utf-8-sig")
+        destinations = (
+            (charger_suivi(), DOSSIER_SAUVEGARDES / f"suivi_{jour}.csv"),
+            (charger_suivi_adresses(), DOSSIER_SAUVEGARDES / f"referents_{jour}.csv"),
+        )
+        for tableau, destination in destinations:
+            temporaire = destination.with_suffix(destination.suffix + ".tmp")
+            tableau.to_csv(temporaire, index=False, sep=";", encoding="utf-8-sig")
+            os.replace(temporaire, destination)
+        return True
     except Exception:
-        pass  # une sauvegarde qui échoue ne doit jamais bloquer la saisie
+        LOGGER.exception("Échec de la sauvegarde CSV automatique")
+        return False
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1027,6 +1178,7 @@ def preparer_export_adresses(suivi_adr: pd.DataFrame, adresses_df: pd.DataFrame)
     return sortie[ordre].rename(columns=libelles)
 
 
+@st.cache_data(show_spinner=False, max_entries=6)
 def vers_excel(df: pd.DataFrame, nom_feuille: str) -> bytes:
     from openpyxl.styles import Alignment, Font, PatternFill
 
@@ -1159,7 +1311,7 @@ def bande_sept_jours(rappels: pd.DataFrame, prefixe: str) -> None:
             unsafe_allow_html=True,
         )
         if col.button("Voir" if n else "—", key=prefixe + "_" + jour.isoformat(),
-                      disabled=(n == 0), use_container_width=True):
+                      disabled=(n == 0), width="stretch"):
             st.session_state.jour_rappel = jour.isoformat()
             st.session_state.pop("idx", None)
             st.rerun()
@@ -1191,10 +1343,10 @@ def grille_mensuelle(rappels: pd.DataFrame, prefixe: str, col_code: str = "Code 
     mois = mois % 12 + 1
 
     n1, n2, n3 = st.columns([1, 3, 1])
-    if n1.button("◀ Mois précédent", key=prefixe + "_prec", use_container_width=True):
+    if n1.button("◀ Mois précédent", key=prefixe + "_prec", width="stretch"):
         st.session_state.cal_decalage -= 1
         st.rerun()
-    if n3.button("Mois suivant ▶", key=prefixe + "_suiv", use_container_width=True):
+    if n3.button("Mois suivant ▶", key=prefixe + "_suiv", width="stretch"):
         st.session_state.cal_decalage += 1
         st.rerun()
     n2.markdown(
@@ -1312,7 +1464,7 @@ def tableau_rappels(rappels: pd.DataFrame, col_code: str, titre: str = "") -> No
         if c not in vue.columns:
             vue[c] = ""
     st.dataframe(vue[list(colonnes)].rename(columns=colonnes),
-                 hide_index=True, use_container_width=True)
+                 hide_index=True, width="stretch")
 
 
 def selecteur_journees(rappels: pd.DataFrame, premier: dt.date, dernier: dt.date,
@@ -1339,7 +1491,7 @@ def selecteur_journees(rappels: pd.DataFrame, premier: dt.date, dernier: dt.date
             libelle = marque + jour.strftime("%d/%m") + " · " + str(n)
             actif = st.session_state.get(cle_etat) == jour.isoformat()
             if col.button(libelle, key=prefixe + "_j_" + jour.isoformat(),
-                          use_container_width=True,
+                          width="stretch",
                           type="primary" if actif else "secondary"):
                 # Un second clic sur la même journée referme le détail.
                 if actif:
@@ -1536,18 +1688,18 @@ def afficher_demo(role: str) -> None:
                     f"{texte}</div>", unsafe_allow_html=True)
         st.progress((idx + 1) / len(etapes))
         c1, c2, c3 = st.columns([1, 1, 1])
-        if c1.button("⬅️ Précédent", disabled=(idx == 0), use_container_width=True, key="demo_prec"):
+        if c1.button("⬅️ Précédent", disabled=(idx == 0), width="stretch", key="demo_prec"):
             st.session_state.demo_etape = idx - 1
             st.rerun()
         if idx < len(etapes) - 1:
-            if c2.button("Suivant ➡️", type="primary", use_container_width=True, key="demo_suiv"):
+            if c2.button("Suivant ➡️", type="primary", width="stretch", key="demo_suiv"):
                 st.session_state.demo_etape = idx + 1
                 st.rerun()
         else:
-            if c2.button("Terminer", type="primary", use_container_width=True, key="demo_fin"):
+            if c2.button("Terminer", type="primary", width="stretch", key="demo_fin"):
                 st.session_state.demo_active = False
                 st.rerun()
-        if c3.button("Fermer", use_container_width=True, key="demo_close"):
+        if c3.button("Fermer", width="stretch", key="demo_close"):
             st.session_state.demo_active = False
             st.rerun()
 
@@ -1566,6 +1718,14 @@ def afficher_demo(role: str) -> None:
 
 coffre = coffre_fichier()
 
+# Après un redémarrage du conteneur, le classeur revient depuis la même base
+# durable que les suivis : aucune intervention ni nouvel export n'est requis.
+if coffre["contenu"] is None:
+    fichier_durable = charger_fichier_maitre()
+    if fichier_durable:
+        coffre["nom"], coffre["contenu"], coffre["charge_le"] = fichier_durable
+        coffre["restaure"] = True
+
 
 def ecran_connexion() -> None:
     """Chargement des fichiers, puis choix du profil et mot de passe."""
@@ -1575,9 +1735,9 @@ def ecran_connexion() -> None:
     if coffre["contenu"] is None or not coffre["restaure"]:
         st.subheader("1. Charger les fichiers de travail")
         st.caption(
-            "Les trois fichiers sont nécessaires pour ouvrir une session : le fichier clients "
-            "et les deux sauvegardes exportées lors de la dernière session. "
-            "Une fois chargés, ils restent disponibles pour toute l'équipe jusqu'au redémarrage du serveur."
+            "Au premier démarrage, chargez le fichier clients et, si elles existent, les deux "
+            "sauvegardes de la campagne. Avec PostgreSQL activé, ils seront ensuite restaurés "
+            "automatiquement après chaque redémarrage."
         )
 
         c1, c2, c3 = st.columns(3)
@@ -1594,7 +1754,7 @@ def ecran_connexion() -> None:
         reprendre = False
         if not base_est_vide():
             with connexion() as con:
-                nb = con.execute("SELECT COUNT(*) FROM suivi").fetchone()[0]
+                nb = executer(con, "SELECT COUNT(*) FROM suivi").fetchone()[0]
             reprendre = st.checkbox(
                 f"La base contient déjà {formater_entier(nb)} fiche(s) — reprendre sans restaurer les sauvegardes",
                 help="À cocher uniquement si le travail en cours est déjà dans l'outil. "
@@ -1609,6 +1769,9 @@ def ecran_connexion() -> None:
                     coffre["nom"] = f_mere.name
                     coffre["charge_le"] = maintenant_iso()
                     coffre["clients"] = None      # sera préparé au premier affichage
+                    enregistrer_fichier_maitre(
+                        coffre["nom"], coffre["contenu"]
+                    )
                 messages = []
                 if not reprendre:
                     messages.append(f"{importer_suivi_clients_csv(f_suivi)} fiches clients restaurées")
@@ -1634,7 +1797,7 @@ def ecran_connexion() -> None:
         with st.form("connexion"):
             nom = st.selectbox("Qui êtes-vous ?", list(PROFILS))
             mdp = st.text_input("Mot de passe", type="password")
-            entrer = st.form_submit_button("Se connecter", type="primary", use_container_width=True)
+            entrer = st.form_submit_button("Se connecter", type="primary", width="stretch")
         if entrer:
             if empreinte(mdp) == charger_empreinte(nom):
                 st.session_state.utilisateur = nom
@@ -1714,10 +1877,17 @@ with st.sidebar:
         f"{LIBELLES_ROLES.get(ROLE, ROLE)}</span></div>",
         unsafe_allow_html=True,
     )
+    if BASE_DISTANTE:
+        st.success("🛡️ Sauvegarde serveur active", icon=None)
+    else:
+        st.warning(
+            "⚠️ Mode local : les données peuvent disparaître au redémarrage. "
+            "Configurez `database.url` dans les Secrets Streamlit."
+        )
     # Rafraîchissement : les données du suivi sont relues à chaque exécution,
     # ce bouton force donc l'affichage des saisies faites par les autres depuis
     # l'ouverture de la page.
-    if st.button("🔄 Actualiser les données", use_container_width=True, type="primary",
+    if st.button("🔄 Actualiser les données", width="stretch", type="primary",
                  help="Recharge le suivi pour voir en temps réel ce que les autres "
                       "ont enregistré depuis votre dernière action."):
         st.cache_data.clear()
@@ -1725,11 +1895,11 @@ with st.sidebar:
     st.caption(f"Données à jour au {dt.datetime.now().strftime('%H:%M:%S')}")
 
     sc1, sc2 = st.columns(2)
-    if sc1.button("🎓 Revoir la démo", use_container_width=True):
+    if sc1.button("🎓 Revoir la démo", width="stretch"):
         st.session_state.demo_active = True
         st.session_state.demo_etape = 0
         st.rerun()
-    if sc2.button("🚪 Déconnexion", use_container_width=True):
+    if sc2.button("🚪 Déconnexion", width="stretch"):
         for cle in ("utilisateur", "role", "idx", "idx_adr", "demo_active",
                     "demo_etape", "saut_code", "jour_rappel", "cal_decalage",
                     "grille_jour_detail", "bande_jour_detail"):
@@ -1875,7 +2045,7 @@ def _detail_rappels(df: pd.DataFrame, avec_bouton: bool) -> None:
                if r.get("note") else ""),
             unsafe_allow_html=True,
         )
-        if avec_bouton and c2.button("Ouvrir", key=f"saut_{r[col_code]}", use_container_width=True):
+        if avec_bouton and c2.button("Ouvrir", key=f"saut_{r[col_code]}", width="stretch"):
             st.session_state.saut_code = str(r[col_code])
             st.rerun()
 
@@ -2041,10 +2211,10 @@ if PEUT_TRAITER:
             st.session_state.idx = max(0, min(st.session_state.idx, len(file_appel) - 1))
 
             nav1, nav2, nav3 = st.columns([1, 2, 1])
-            if nav1.button("⬅️ Précédent", use_container_width=True):
+            if nav1.button("⬅️ Précédent", width="stretch"):
                 st.session_state.idx = max(0, st.session_state.idx - 1)
                 st.rerun()
-            if nav3.button("Suivant ➡️", use_container_width=True):
+            if nav3.button("Suivant ➡️", width="stretch"):
                 st.session_state.idx = min(len(file_appel) - 1, st.session_state.idx + 1)
                 st.rerun()
             nav2.markdown(
@@ -2138,7 +2308,7 @@ if PEUT_TRAITER:
                             st.dataframe(
                                 apercu[["Code adresse", "Nom site", "Ville", "statut_adr", "traite_par"]]
                                 .rename(columns={"statut_adr": "Statut", "traite_par": "Vérifié par"}),
-                                hide_index=True, use_container_width=True,
+                                hide_index=True, width="stretch",
                             )
                             st.caption("Complétez ces points dans l'onglet « Points de livraison », "
                                        "en recherchant par code client mère.")
@@ -2210,7 +2380,7 @@ if PEUT_TRAITER:
                             "Champs à vider", list(LIBELLES_CHAMPS), default=[],
                             key=f"effacer_{code}", label_visibility="collapsed")
                     valide = st.form_submit_button("💾 Enregistrer & passer au suivant",
-                                                   use_container_width=True, type="primary")
+                                                   width="stretch", type="primary")
 
                 if valide:
                     erreurs = []
@@ -2230,19 +2400,27 @@ if PEUT_TRAITER:
                         effacements = [LIBELLES_CHAMPS[lib] for lib in a_effacer]
                         if supprimer_rappel:
                             effacements.append("rappel_date")
-                        enregistrer(
-                            code, UTILISATEUR, effacements=effacements,
-                            statut=statut, existe=existe,
-                            produits="|".join(produits),
-                            email_maj=email_maj.strip(), tel_maj=tel_maj.strip(),
-                            doublon_de=doublon_de.strip(), note=note.strip(),
-                            motif_sortie="" if motif_sortie == "—" else motif_sortie,
-                            rappel_date="" if supprimer_rappel else (rappel.isoformat() if rappel else ""),
-                        )
-                        journaliser_appel(UTILISATEUR, "client", code, statut)
-                        sauvegarde_auto()
-                        st.session_state.idx = min(len(file_appel) - 1, st.session_state.idx + 1)
-                        st.rerun()
+                        try:
+                            enregistrer(
+                                code, UTILISATEUR, effacements=effacements,
+                                statut=statut, existe=existe,
+                                produits="|".join(produits),
+                                email_maj=email_maj.strip(), tel_maj=tel_maj.strip(),
+                                doublon_de=doublon_de.strip(), note=note.strip(),
+                                motif_sortie="" if motif_sortie == "—" else motif_sortie,
+                                rappel_date="" if supprimer_rappel else (rappel.isoformat() if rappel else ""),
+                            )
+                            journaliser_appel(UTILISATEUR, "client", code, statut)
+                            sauvegarde_auto()
+                        except Exception:
+                            LOGGER.exception("Échec d'enregistrement du client %s", code)
+                            st.error(
+                                "Enregistrement momentanément impossible. Vos champs restent affichés : "
+                                "attendez quelques secondes puis réessayez."
+                            )
+                        else:
+                            st.session_state.idx = min(len(file_appel) - 1, st.session_state.idx + 1)
+                            st.rerun()
 
                 # ── Réattribution manuelle, réservée à l'administrateur ──────
                 # Permet de corriger une attribution : rendre une fiche à la
@@ -2270,22 +2448,27 @@ if PEUT_TRAITER:
                                 key=f"admin_statut_{code}",
                             )
                             appliquer = st.form_submit_button(
-                                "Appliquer la modification", use_container_width=True)
+                                "Appliquer la modification", width="stretch")
                         if appliquer:
                             traitant = "" if nouveau_qui == "Non traité" else nouveau_qui
                             if traitant == actuel and nouveau_statut == ligne["statut"]:
                                 st.info("Aucun changement à appliquer.")
                             else:
-                                reattribuer(
-                                    code, traitant, nouveau_statut, UTILISATEUR,
-                                    {"traite_par": actuel, "statut": ligne["statut"]},
-                                )
-                                sauvegarde_auto()
-                                st.success(
-                                    f"Fiche {code} : attribuée à "
-                                    f"{traitant or 'personne'}, statut « {nouveau_statut} »."
-                                )
-                                st.rerun()
+                                try:
+                                    reattribuer(
+                                        code, traitant, nouveau_statut, UTILISATEUR,
+                                        {"traite_par": actuel, "statut": ligne["statut"]},
+                                    )
+                                    sauvegarde_auto()
+                                except Exception:
+                                    LOGGER.exception("Échec de réattribution du client %s", code)
+                                    st.error("Modification momentanément impossible. Réessayez dans quelques secondes.")
+                                else:
+                                    st.success(
+                                        f"Fiche {code} : attribuée à "
+                                        f"{traitant or 'personne'}, statut « {nouveau_statut} »."
+                                    )
+                                    st.rerun()
 
 
     # ── ONGLET POINTS DE LIVRAISON ───────────────────────────────────────────
@@ -2345,10 +2528,10 @@ if PEUT_TRAITER:
                 st.session_state.idx_adr = max(0, min(st.session_state.idx_adr, len(vue) - 1))
 
                 n1, n2, n3 = st.columns([1, 2, 1])
-                if n1.button("⬅️ Précédent", key="adr_prev", use_container_width=True):
+                if n1.button("⬅️ Précédent", key="adr_prev", width="stretch"):
                     st.session_state.idx_adr = max(0, st.session_state.idx_adr - 1)
                     st.rerun()
-                if n3.button("Suivant ➡️", key="adr_next", use_container_width=True):
+                if n3.button("Suivant ➡️", key="adr_next", width="stretch"):
                     st.session_state.idx_adr = min(len(vue) - 1, st.session_state.idx_adr + 1)
                     st.rerun()
                 n2.markdown(
@@ -2409,20 +2592,28 @@ if PEUT_TRAITER:
                                 default=[], key=f"effacer_adr_{code_adr}",
                                 label_visibility="collapsed")
                         valide_adr = st.form_submit_button("💾 Enregistrer & suivant",
-                                                           use_container_width=True, type="primary")
+                                                           width="stretch", type="primary")
                     if valide_adr:
                         corresp_adr = {"Référent sur place": "referent",
                                        "Téléphone du site": "tel_site", "Note": "note_adr"}
-                        enregistrer_adresse(
-                            code_adr, UTILISATEUR,
-                            effacements=[corresp_adr[x] for x in a_effacer_adr],
-                            referent=referent.strip(), tel_site=tel_site.strip(),
-                            statut_adr=statut_adr, note_adr=note_adr.strip(),
-                        )
-                        journaliser_appel(UTILISATEUR, "adresse", code_adr, statut_adr)
-                        sauvegarde_auto()
-                        st.session_state.idx_adr = min(len(vue) - 1, st.session_state.idx_adr + 1)
-                        st.rerun()
+                        try:
+                            enregistrer_adresse(
+                                code_adr, UTILISATEUR,
+                                effacements=[corresp_adr[x] for x in a_effacer_adr],
+                                referent=referent.strip(), tel_site=tel_site.strip(),
+                                statut_adr=statut_adr, note_adr=note_adr.strip(),
+                            )
+                            journaliser_appel(UTILISATEUR, "adresse", code_adr, statut_adr)
+                            sauvegarde_auto()
+                        except Exception:
+                            LOGGER.exception("Échec d'enregistrement du point %s", code_adr)
+                            st.error(
+                                "Enregistrement momentanément impossible. Vos champs restent affichés : "
+                                "attendez quelques secondes puis réessayez."
+                            )
+                        else:
+                            st.session_state.idx_adr = min(len(vue) - 1, st.session_state.idx_adr + 1)
+                            st.rerun()
 
 
     # ── ONGLET EXPORT ────────────────────────────────────────────────────────
@@ -2436,51 +2627,59 @@ if PEUT_TRAITER:
         else:
             st.success("✅ Tout est exporté : rien en attente.")
         st.caption(
-            "Ces fichiers sont la sauvegarde de la campagne et servent à rouvrir une session "
-            "le lendemain. La donnée de référence reste Logimatique."
+            "Avec la sauvegarde serveur active, les exports ne sont plus nécessaires pour "
+            "reprendre le travail après une coupure. Ils restent utiles pour contrôle et archivage."
         )
 
-        st.markdown("##### Suivi des appels clients")
-        if suivi.empty:
-            st.info("Aucun appel enregistré pour le moment.")
-        else:
-            export = preparer_export(suivi, base, col_code)
-            e1, e2 = st.columns(2)
-            e1.download_button(
-                "⬇️ Suivi clients — CSV (Excel FR)",
-                export.to_csv(index=False, sep=";").encode("utf-8-sig"),
-                file_name=f"suivi_appels_hympyr_{dt.date.today():%Y%m%d}.csv",
-                mime="text/csv", use_container_width=True)
-            e2.download_button(
-                "⬇️ Suivi clients — Excel (.xlsx)",
-                vers_excel(export, "Suivi appels"),
-                file_name=f"suivi_appels_hympyr_{dt.date.today():%Y%m%d}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True)
-            with st.expander("Aperçu de l'export clients"):
-                st.dataframe(export, hide_index=True, use_container_width=True)
+        if st.button("📦 Préparer les fichiers d'export", width="stretch"):
+            st.session_state["_exports_prepares"] = True
 
-        if not adresses.empty:
-            st.divider()
-            st.markdown("##### Points de livraison et référents")
-            export_adr = preparer_export_adresses(suivi_adr, adresses)
-            if export_adr.empty:
-                st.info("Aucun point de livraison à exporter.")
+        # La création de deux classeurs Excel complets à chaque clic dans
+        # l'application provoquait une forte consommation mémoire. Streamlit
+        # calcule les onglets masqués par défaut : on ne prépare donc ces
+        # fichiers qu'après une demande explicite.
+        if st.session_state.get("_exports_prepares"):
+            st.markdown("##### Suivi des appels clients")
+            if suivi.empty:
+                st.info("Aucun appel enregistré pour le moment.")
             else:
-                a1, a2 = st.columns(2)
-                a1.download_button(
-                    "⬇️ Points de livraison — CSV (Excel FR)",
-                    export_adr.to_csv(index=False, sep=";").encode("utf-8-sig"),
-                    file_name=f"points_livraison_hympyr_{dt.date.today():%Y%m%d}.csv",
-                    mime="text/csv", use_container_width=True)
-                a2.download_button(
-                    "⬇️ Points de livraison — Excel (.xlsx)",
-                    vers_excel(export_adr, "Points de livraison"),
-                    file_name=f"points_livraison_hympyr_{dt.date.today():%Y%m%d}.xlsx",
+                export = preparer_export(suivi, base, col_code)
+                e1, e2 = st.columns(2)
+                e1.download_button(
+                    "⬇️ Suivi clients — CSV (Excel FR)",
+                    export.to_csv(index=False, sep=";").encode("utf-8-sig"),
+                    file_name=f"suivi_appels_hympyr_{dt.date.today():%Y%m%d}.csv",
+                    mime="text/csv", width="stretch")
+                e2.download_button(
+                    "⬇️ Suivi clients — Excel (.xlsx)",
+                    vers_excel(export, "Suivi appels"),
+                    file_name=f"suivi_appels_hympyr_{dt.date.today():%Y%m%d}.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    use_container_width=True)
-                with st.expander("Aperçu de l'export points de livraison"):
-                    st.dataframe(export_adr, hide_index=True, use_container_width=True)
+                    width="stretch")
+                with st.expander("Aperçu de l'export clients"):
+                    st.dataframe(export, hide_index=True, width="stretch")
+
+            if not adresses.empty:
+                st.divider()
+                st.markdown("##### Points de livraison et référents")
+                export_adr = preparer_export_adresses(suivi_adr, adresses)
+                if export_adr.empty:
+                    st.info("Aucun point de livraison à exporter.")
+                else:
+                    a1, a2 = st.columns(2)
+                    a1.download_button(
+                        "⬇️ Points de livraison — CSV (Excel FR)",
+                        export_adr.to_csv(index=False, sep=";").encode("utf-8-sig"),
+                        file_name=f"points_livraison_hympyr_{dt.date.today():%Y%m%d}.csv",
+                        mime="text/csv", width="stretch")
+                    a2.download_button(
+                        "⬇️ Points de livraison — Excel (.xlsx)",
+                        vers_excel(export_adr, "Points de livraison"),
+                        file_name=f"points_livraison_hympyr_{dt.date.today():%Y%m%d}.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        width="stretch")
+                    with st.expander("Aperçu de l'export points de livraison"):
+                        st.dataframe(export_adr, hide_index=True, width="stretch")
 
         if modifs_en_attente > 0:
             st.divider()
@@ -2566,7 +2765,7 @@ if PEUT_PILOTER:
             }
             for nom in COMMERCIALES
         ])
-        st.dataframe(tableau, hide_index=True, use_container_width=True)
+        st.dataframe(tableau, hide_index=True, width="stretch")
 
         non_traitees = int((base["traite_par"].astype(str).str.strip() == "").sum())
         st.caption(f"{formater_entier(non_traitees)} fiche(s) ne sont encore attribuées à personne.")
@@ -2634,7 +2833,7 @@ if PEUT_PILOTER:
                              "traite_par", "rappel_date", "note"]]
                     .rename(columns={col_code: "Code client", "traite_par": "Traité par",
                                      "rappel_date": "À rappeler le", "note": "Notes"}),
-                    hide_index=True, use_container_width=True,
+                    hide_index=True, width="stretch",
                 )
 
         # ── Reporting journalier des appels ─────────────────────────────────
@@ -2673,13 +2872,13 @@ if PEUT_PILOTER:
             lisible = tableau.reset_index()
             lisible["jour"] = pd.to_datetime(lisible["jour"]).dt.strftime("%a %d/%m")
             st.dataframe(lisible.rename(columns={"jour": "Jour"}).iloc[::-1],
-                         hide_index=True, use_container_width=True)
+                         hide_index=True, width="stretch")
 
             if not rapport["par_statut"].empty:
                 st.markdown("##### Résultat des appels, par commerciale")
                 st.dataframe(rapport["par_statut"].reset_index()
                              .rename(columns={"utilisateur": "Commerciale"}),
-                             hide_index=True, use_container_width=True)
+                             hide_index=True, width="stretch")
 
             st.download_button(
                 "⬇️ Télécharger le reporting (CSV)",
@@ -2713,7 +2912,7 @@ if PEUT_PILOTER:
                     affichage.rename(columns={
                         "horodatage": "Quand", "auteur": "Par qui",
                         "action": "Action", "cible": "Fiche", "detail": "Détail"}),
-                    hide_index=True, use_container_width=True,
+                    hide_index=True, width="stretch",
                 )
 
         st.divider()

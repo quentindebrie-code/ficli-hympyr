@@ -1,4 +1,7 @@
 streamlit==1.64.0
 pandas==2.2.3
 openpyxl==3.1.5
-psycopg[binary]==3.3.5
+# Déclarer les deux distributions explicitement évite que le cache `uv` de
+# Streamlit Cloud conserve `psycopg` sans son implémentation binaire.
+psycopg==3.3.5
+psycopg-binary==3.3.5

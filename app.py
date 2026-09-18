@@ -1879,6 +1879,28 @@ PEUT_TRAITER = ROLE in ("commercial", "admin")   # onglets appels, points, expor
 PEUT_PILOTER = ROLE in ("manager", "admin")      # onglet tableau de bord
 PEUT_REINITIALISER = ROLE in ROLES_RESET         # exclusif au manager
 
+# st.tabs calcule aussi le contenu des onglets masqués à chaque interaction.
+# Le contrôle segmenté conserve l'apparence d'une navigation par onglets mais
+# permet de ne construire que l'écran réellement consulté.
+ONGLET_APPELS = "☎️  Appels clients"
+ONGLET_POINTS = "📦  Points de livraison"
+ONGLET_EXPORT = "⬇️  Export"
+ONGLET_DASH = "📊  Tableau de bord"
+libelles_onglets = []
+if PEUT_TRAITER:
+    libelles_onglets += [ONGLET_APPELS, ONGLET_POINTS, ONGLET_EXPORT]
+if PEUT_PILOTER:
+    libelles_onglets += [ONGLET_DASH]
+onglet_actif = st.segmented_control(
+    "Navigation",
+    libelles_onglets,
+    default=libelles_onglets[0],
+    required=True,
+    key="navigation_principale",
+    label_visibility="collapsed",
+    width="stretch",
+)
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CHARGEMENT DES DONNÉES
@@ -1913,7 +1935,7 @@ mes_rappels = rappels_dus(base, UTILISATEUR) if PEUT_TRAITER_TMP else pd.DataFra
 tous_rappels = rappels_dus(base)
 # Rappels programmés, passés comme à venir : matière du calendrier.
 mon_calendrier = rappels_planifies(base, UTILISATEUR) if PEUT_TRAITER_TMP else pd.DataFrame()
-calendrier_equipe = rappels_planifies(base)
+calendrier_equipe = rappels_planifies(base) if onglet_actif == ONGLET_DASH else pd.DataFrame()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1953,7 +1975,7 @@ with st.sidebar:
     if sc2.button("🚪 Déconnexion", width="stretch"):
         for cle in ("utilisateur", "role", "idx", "idx_adr", "demo_active",
                     "demo_etape", "saut_code", "jour_rappel", "cal_decalage",
-                    "grille_jour_detail", "bande_jour_detail"):
+                    "grille_jour_detail", "bande_jour_detail", "navigation_principale"):
             st.session_state.pop(cle, None)
         st.rerun()
 
@@ -2158,7 +2180,7 @@ if not acces_direct and jour_choisi and PEUT_TRAITER:
         file_appel = selection.drop(columns=["date_rappel"]).reset_index(drop=True)
         acces_direct = True   # les autres filtres ne s'appliquent pas
 
-if not acces_direct and PEUT_TRAITER:
+if not acces_direct and PEUT_TRAITER and onglet_actif == ONGLET_APPELS:
     if f_traitement:
         masques = []
         if "Non traité" in f_traitement:
@@ -2196,27 +2218,9 @@ if not acces_direct and PEUT_TRAITER:
 # ONGLETS SELON LE RÔLE
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Les onglets visibles découlent des droits, pas d'un rôle en dur : le profil
-# administrateur voit les quatre, les autres voient les leurs.
-libelles_onglets = []
-if PEUT_TRAITER:
-    libelles_onglets += ["☎️  Appels clients", "📦  Points de livraison", "⬇️  Export"]
-if PEUT_PILOTER:
-    libelles_onglets += ["📊  Tableau de bord"]
-
-onglets = st.tabs(libelles_onglets)
-onglet_appel = onglet_adr = onglet_export = onglet_dash = None
-curseur = 0
-if PEUT_TRAITER:
-    onglet_appel, onglet_adr, onglet_export = onglets[curseur:curseur + 3]
-    curseur += 3
-if PEUT_PILOTER:
-    onglet_dash = onglets[curseur]
-
-
 # ── ONGLETS DE TRAVAIL (commerciales et administrateur) ──────────────────────
 if PEUT_TRAITER:
-    with onglet_appel:
+    if onglet_actif == ONGLET_APPELS:
         # Calendrier de la semaine, replié par défaut pour ne pas repousser
         # la fiche hors de l'écran.
         with st.expander("🗓️ Mes rappels des sept prochains jours",
@@ -2523,7 +2527,7 @@ if PEUT_TRAITER:
 
 
     # ── ONGLET POINTS DE LIVRAISON ───────────────────────────────────────────
-    with onglet_adr:
+    if onglet_actif == ONGLET_POINTS:
         if adresses.empty:
             st.info("Le fichier ne contient pas de feuille « Adresses livraison ».")
         else:
@@ -2668,7 +2672,7 @@ if PEUT_TRAITER:
 
 
     # ── ONGLET EXPORT ────────────────────────────────────────────────────────
-    with onglet_export:
+    if onglet_actif == ONGLET_EXPORT:
         st.subheader("Export du suivi")
         if modifs_en_attente > 0:
             st.warning(
@@ -2742,7 +2746,7 @@ if PEUT_TRAITER:
 
 # ── ONGLET TABLEAU DE BORD (manager et administrateur) ───────────────────────
 if PEUT_PILOTER:
-    with onglet_dash:
+    if onglet_actif == ONGLET_DASH:
         st.subheader("🎯 Objectif pour tenir l'échéance")
         st.caption(f"Échéance : émission de la facturation électronique au "
                    f"{DEADLINE.strftime('%d/%m/%Y')} pour les PME.")

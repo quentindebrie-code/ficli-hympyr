@@ -1889,6 +1889,21 @@ def confirmer_reprise_base() -> None:
     """Valide la reprise avant le rerun déclenché par le bouton Streamlit."""
     coffre["restaure"] = True
 
+
+def demander_autres_fichiers() -> None:
+    """Revient à l'upload sans déclencher la restauration automatique.
+
+    Le classeur courant reste disponible tant que son remplaçant n'a pas été
+    validé. Mettre ``contenu`` à ``None`` le faisait auparavant recharger depuis
+    PostgreSQL au rerun suivant, ce qui renvoyait aussitôt à la connexion.
+    """
+    coffre["restaure"] = False
+    coffre["clients"] = None
+    st.session_state.pop("reprendre_base_existante", None)
+    for cle in ("up_mere", "up_suivi", "up_refs"):
+        st.session_state.pop(cle, None)
+
+
 # Après un redémarrage du conteneur, le classeur revient depuis la même base
 # durable que les suivis : aucune intervention ni nouvel export n'est requis.
 if coffre["contenu"] is None:
@@ -1993,13 +2008,10 @@ def ecran_connexion() -> None:
                 st.rerun()
             else:
                 st.error("Mot de passe incorrect.")
-        if st.button("📂 Charger d'autres fichiers"):
-            coffre["contenu"] = None
-            coffre["restaure"] = False
-            coffre["clients"] = None
-            st.session_state.pop("reprendre_base_existante", None)
-            st.cache_data.clear()
-            st.rerun()
+        st.button(
+            "📂 Charger d'autres fichiers",
+            on_click=demander_autres_fichiers,
+        )
     st.stop()
 
 
